@@ -280,7 +280,7 @@ async function fetchWttr(lat, lon) {
     relative_humidity_2m: c.humidity != null ? Number(c.humidity) : null,
     wind_speed_10m: Number.isFinite(kmph) ? kmph / 3.6 : null,
     wind_direction_10m: c.winddirDegree != null ? Number(c.winddirDegree) : null,
-    desc: desc ? (WTTR_CN[desc] || desc) : '',
+    desc: desc ? (WTTR_CN[desc.trim()] || desc.trim()) : '',
   };
 }
 
