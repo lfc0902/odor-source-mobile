@@ -65,6 +65,23 @@ async function evalJs(cdp, expression) {
   return r.result.value;
 }
 
+/* 真实鼠标点击（带用户手势），用于剪贴板等只允许手势触发的 API */
+async function trustedClick(cdp, selector) {
+  const box = await evalJs(cdp, `(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  })()`);
+  if (!box) throw new Error('找不到元素: ' + selector);
+  await cdp.send('Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1,
+  });
+  await cdp.send('Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: box.x, y: box.y, button: 'left', clickCount: 1,
+  });
+}
+
 async function shot(cdp, filename) {
   const r = await cdp.send('Page.captureScreenshot', {
     format: 'png',
@@ -261,7 +278,7 @@ async function shot(cdp, filename) {
     // 巡测：走动记录 3 个点（气味逐渐增强）→ 增强方向箭头 + 轨迹
     const surveyWeather = `{source:'手动输入', wind_speed_10m:2, wind_direction_10m:0,
       desc:'', temperature_2m:null, relative_humidity_2m:null, history:null}`;
-    report.survey = JSON.parse(await evalJs(cdp, `(() => {
+    const surveyActive = JSON.parse(await evalJs(cdp, `(() => {
       clearAll();
       startSurvey();
       const active = !!state.survey;
@@ -274,7 +291,7 @@ async function shot(cdp, filename) {
       state.lat = 39.9082; state.lon = 116.4074;
       selectLevel(5); addRecord();
       const g = state.survey && state.survey.gradient;
-      const res = {
+      return JSON.stringify({
         active,
         btn: document.getElementById('btnSurvey').innerText,
         records: state.records.length,
@@ -283,17 +300,32 @@ async function shot(cdp, filename) {
         gradText: document.getElementById('surveyGrad').innerText,
         hasArrow: !!state.gradientLayer && map.hasLayer(state.gradientLayer),
         hasArrowHead: !!state.gradientMarker,
-      };
-      stopSurvey();
-      res.stopped = !state.survey;
-      res.stopBtn = document.getElementById('btnSurvey').innerText;
-      res.stopText = document.getElementById('surveyText').innerText;
-      res.lastSurveyPoints = state.lastSurvey && state.lastSurvey.points;
-      res.arrowAfterStop = !!state.gradientLayer && map.hasLayer(state.gradientLayer);
-      return JSON.stringify(res);
+        bannerVisible: !document.getElementById('surveyBanner')
+          .classList.contains('hidden'),
+        bannerText: document.getElementById('surveyBannerText').innerText,
+        cardOn: document.getElementById('survey').classList.contains('on'),
+        btnOn: document.getElementById('btnSurvey').classList.contains('on'),
+        toastText: document.getElementById('toast').innerText,
+        toastShown: document.getElementById('toast').classList.contains('show'),
+      });
     })()`));
     await sleep(800);
     await shot(cdp, '_e2e_survey.png');
+    const surveyStopped = JSON.parse(await evalJs(cdp, `(() => {
+      stopSurvey();
+      return JSON.stringify({
+        stopped: !state.survey,
+        stopBtn: document.getElementById('btnSurvey').innerText,
+        stopText: document.getElementById('surveyText').innerText,
+        lastSurveyPoints: state.lastSurvey && state.lastSurvey.points,
+        arrowAfterStop: !!state.gradientLayer && map.hasLayer(state.gradientLayer),
+        bannerHidden: document.getElementById('surveyBanner')
+          .classList.contains('hidden'),
+        cardOff: !document.getElementById('survey').classList.contains('on'),
+        stopToast: document.getElementById('toast').innerText,
+      });
+    })()`));
+    report.survey = Object.assign(surveyActive, surveyStopped);
 
     // 风场历史：用固定响应验证解析与一致性计算
     report.windHistory = JSON.parse(await evalJs(cdp, `(async () => {
@@ -429,6 +461,96 @@ async function shot(cdp, filename) {
     await sleep(400);
     await shot(cdp, '_e2e_tools.png');
 
+    // 真实点击导出按钮：必须出现面板内结果 + 顶部浮层，并真的产出文件
+    const dlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'edge_dl_'));
+    let downloadCdpOk = true;
+    try {
+      await cdp.send('Page.setDownloadBehavior', {
+        behavior: 'allow', downloadPath: dlDir,
+      });
+    } catch (_) {
+      try {
+        await cdp.send('Browser.setDownloadBehavior', {
+          behavior: 'allow', downloadPath: dlDir,
+        });
+      } catch (_) {
+        downloadCdpOk = false;
+      }
+    }
+
+    async function readDownloaded(ext, exclude = new Set()) {
+      for (let i = 0; i < 40; i++) {
+        const files = fs.readdirSync(dlDir)
+          .filter((f) => f.endsWith(ext) && !f.endsWith('.crdownload') &&
+            !exclude.has(f));
+        if (files.length) {
+          const p = path.join(dlDir, files[0]);
+          return { name: files[0], text: fs.readFileSync(p, 'utf8') };
+        }
+        await sleep(250);
+      }
+      return null;
+    }
+
+    const exportClick = { cdpOk: downloadCdpOk };
+    await evalJs(cdp, 'document.getElementById("btnExportCsv").click(); true');
+    await sleep(400);
+    exportClick.noteVisible = await evalJs(cdp,
+      '!document.getElementById("exportNote").classList.contains("hidden")');
+    exportClick.noteText = await evalJs(cdp,
+      'document.getElementById("exportNoteText").innerText');
+    exportClick.toastText = await evalJs(cdp,
+      'document.getElementById("toast").innerText');
+    exportClick.toastShown = await evalJs(cdp,
+      'document.getElementById("toast").classList.contains("show")');
+    const csvFile = await readDownloaded('.csv');
+    exportClick.csv = csvFile && {
+      name: csvFile.name,
+      bom: csvFile.text.charCodeAt(0) === 0xFEFF,
+      header: csvFile.text.replace(/^﻿/, '').split(/\r?\n/)[0],
+      lines: csvFile.text.trim().split(/\r?\n/).length,
+    };
+
+    await evalJs(cdp, 'document.getElementById("btnExportGeo").click(); true');
+    const geoFile = await readDownloaded('.geojson');
+    let geoFeatures = null;
+    try {
+      geoFeatures = geoFile ? JSON.parse(geoFile.text).features.length : null;
+    } catch (_) { geoFeatures = -1; }
+    exportClick.geojson = geoFile && {
+      name: geoFile.name,
+      features: geoFeatures,
+    };
+
+    await evalJs(cdp, 'toggleEvalPanel(); document.getElementById("btnEvalExport").click(); true');
+    const evalFile = await readDownloaded('.csv',
+      new Set([csvFile && csvFile.name].filter(Boolean)));
+    exportClick.evalCsv = evalFile && {
+      name: evalFile.name,
+      lines: evalFile.text.trim().split(/\r?\n/).length,
+      changed: evalFile.name !== (csvFile && csvFile.name),
+    };
+    report.exportClick = exportClick;
+    await evalJs(cdp,
+      'document.getElementById("exportNote").scrollIntoView({block:"center"}); true');
+    await sleep(400);
+    await shot(cdp, '_e2e_export.png');
+
+    // 复制兜底：真实手势点击 + 剪贴板权限，验证能复制成功
+    try {
+      await cdp.send('Page.bringToFront');
+      await cdp.send('Browser.grantPermissions', {
+        origin: new URL(BASE).origin,
+        permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'],
+      });
+    } catch (_) { /* 权限 API 不可用则走 execCommand 兜底 */ }
+    await trustedClick(cdp, '#btnExportCopy');
+    await sleep(900);
+    exportClick.copyNote = await evalJs(cdp,
+      'document.getElementById("exportNoteText").innerText');
+    exportClick.copyToast = await evalJs(cdp,
+      'document.getElementById("toast").innerText');
+
     // 恢复后删除单条记录 → 融合与本机会话同步更新
     report.deleteRecord = JSON.parse(await evalJs(cdp, `(() => {
       const before = state.records.length;
@@ -442,6 +564,16 @@ async function shot(cdp, filename) {
     })()`));
     await evalJs(cdp, 'clearAll(); true');
     report.afterNewTestsClear = await evalJs(cdp, 'state.records.length');
+
+    // 没有记录时点导出：必须给出可见的错误提示，而不是“没动静”
+    await evalJs(cdp, 'document.getElementById("btnExportCsv").click(); true');
+    report.emptyExport = JSON.parse(await evalJs(cdp, `JSON.stringify({
+      noteVisible: !document.getElementById('exportNote').classList.contains('hidden'),
+      isErr: document.getElementById('exportNote').classList.contains('err'),
+      noteText: document.getElementById('exportNoteText').innerText,
+      toastText: document.getElementById('toast').innerText,
+      toastShown: document.getElementById('toast').classList.contains('show'),
+    })`));
 
     // 备源链路模拟：让 Open-Meteo 失败，应自动落到 wttr.in
     report.fallback = JSON.parse(await evalJs(cdp, `(async () => {

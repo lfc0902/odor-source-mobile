@@ -52,6 +52,7 @@ const state = {
   evalMarker: null,
   evalLine: null,
   evals: [],          // 已保存的评估结果
+  lastExport: null,   // 最近一次导出 {filename, text, mime, label}
 };
 
 const CALIB_KEY = 'odor_calib_v1';
@@ -84,6 +85,7 @@ state.evals = loadEvals();
 
 const { gradient: smellGradient, windStability, sigFromStability } = SURVEY;
 
+const IS_WECHAT = /MicroMessenger/i.test(navigator.userAgent);
 const $ = (id) => document.getElementById(id);
 const els = {
   loc: $('locText'),
@@ -114,8 +116,15 @@ const els = {
   surveyBtn: $('btnSurvey'),
   surveyText: $('surveyText'),
   surveyGrad: $('surveyGrad'),
+  surveyBanner: $('surveyBanner'),
+  surveyBannerText: $('surveyBannerText'),
   exportCsv: $('btnExportCsv'),
   exportGeo: $('btnExportGeo'),
+  exportNote: $('exportNote'),
+  exportNoteText: $('exportNoteText'),
+  exportRetry: $('btnExportRetry'),
+  exportCopy: $('btnExportCopy'),
+  toast: $('toast'),
   evalToggle: $('btnEvalToggle'),
   evalPanel: $('evalPanel'),
   evalPick: $('btnEvalPick'),
@@ -215,6 +224,33 @@ function setWarn(msg, persist = false) {
 function clearWarn() {
   if (warnTimer) clearTimeout(warnTimer);
   els.warn.classList.add('hidden');
+}
+
+/* 顶部浮层提示：不随底部面板滚动，确保操作后一定看得到 */
+let toastTimer = null;
+let toastHideTimer = null;
+function showToast(msg, type = 'info', ms = 4200) {
+  if (!els.toast) return;
+  els.toast.textContent = msg;
+  els.toast.className = 'toast show ' + type;
+  if (toastTimer) clearTimeout(toastTimer);
+  if (toastHideTimer) clearTimeout(toastHideTimer);
+  toastTimer = setTimeout(() => {
+    els.toast.classList.remove('show');
+    toastHideTimer = setTimeout(() => els.toast.classList.add('hidden'), 220);
+  }, ms);
+}
+
+/* 导出结果直接显示在按钮下方，避免提示在面板顶部看不见 */
+function showExportNote(msg, isErr) {
+  els.exportNoteText.textContent = msg;
+  els.exportNote.classList.toggle('err', !!isErr);
+  els.exportNote.classList.remove('hidden');
+  if (typeof els.exportNote.scrollIntoView === 'function') {
+    try {
+      els.exportNote.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    } catch (_) { /* 老浏览器忽略 */ }
+  }
 }
 
 function renderLevelButtons() {
@@ -885,6 +921,13 @@ function saveSession() {
       savedAt: new Date().toISOString(),
       seq: state.seq,
       records: state.records.map(recordData),
+      lastSurvey: state.lastSurvey ? {
+        id: state.lastSurvey.id,
+        gradient: state.lastSurvey.gradient || null,
+        points: state.lastSurvey.points || 0,
+        lat: state.lastSurvey.lat,
+        lon: state.lastSurvey.lon,
+      } : null,
     }));
   } catch (_) { /* 隐私模式/容量不足 */ }
 }
@@ -914,10 +957,30 @@ function restoreSession() {
   recs.forEach(buildRecordLayers);
   state.records = recs;
   state.seq = Math.max(saved.seq || 0, ...recs.map((r) => r.id || 0));
+  const ls = saved.lastSurvey;
+  if (ls && Number.isFinite(Number(ls.lat)) && Number.isFinite(Number(ls.lon))) {
+    state.lastSurvey = {
+      id: Number(ls.id) || null,
+      gradient: ls.gradient && Number.isFinite(Number(ls.gradient.brg))
+        ? ls.gradient : null,
+      points: Number(ls.points) || 0,
+      lat: Number(ls.lat),
+      lon: Number(ls.lon),
+    };
+  }
   if (!recs.length) return;
   renderRecords();
   renderSummary(recs[recs.length - 1]);
   updateFusion();
+  if (state.lastSurvey) {
+    updateSurveyGradient();
+    const n = surveyRecords().length;
+    if (n) {
+      els.surveyText.textContent = `巡测结束：共记录 ${n} 个点` +
+        (state.lastSurvey.gradient && state.lastSurvey.gradient.brg != null
+          ? '，气味增强方向见地图箭头' : '');
+    }
+  }
   setTimeout(() => {
     fitToLayer(L.featureGroup(recs.map((r) => r.sector)));
   }, 300);
@@ -1071,6 +1134,8 @@ function focusRecord(r) {
 
 function clearAll() {
   if (state.survey) stopSurvey();
+  els.survey.classList.remove('on');
+  els.surveyBanner.classList.add('hidden');
   removeHeatmap();
   state.records.forEach((r) => {
     map.removeLayer(r.sector);
@@ -1185,7 +1250,10 @@ function updateSurveyGradient() {
 
 function updateSurveyUI() {
   const s = state.survey;
-  if (!s) return;
+  if (!s) {
+    els.surveyBanner.classList.add('hidden');
+    return;
+  }
   const mins = Math.floor((Date.now() - s.startedAt) / 60000);
   const n = state.records.filter((r) => r.surveyId === s.id).length;
   const since = Math.floor((Date.now() - s.lastPromptAt) / 1000);
@@ -1195,6 +1263,11 @@ function updateSurveyUI() {
   else if (due) txt += ` · 距上次评分 ${since} 秒，建议再评一次`;
   els.surveyText.textContent = txt;
   els.surveyText.classList.toggle('due', due);
+
+  els.surveyBanner.classList.remove('hidden');
+  els.surveyBannerText.textContent = `巡测中 · ${mins} 分钟 · ${n} 点` +
+    (due ? ' · 该评分了' : '');
+
   if (due && !s.dueNotified) {
     s.dueNotified = true;
     if (navigator.vibrate) {
@@ -1231,10 +1304,12 @@ function startSurvey() {
   if (state.survey) { stopSurvey(); return; }
   if (!navigator.geolocation) {
     setWarn('此浏览器不支持定位，无法巡测；可在不同位置点地图手动记录。', true);
+    showToast('此浏览器不支持定位，无法巡测', 'err');
     return;
   }
   if (!window.isSecureContext) {
     setWarn('巡测需要 HTTPS 定位；可点击地图手动记录，或改用 HTTPS 访问。', true);
+    showToast('巡测需要 HTTPS 定位，请改用 HTTPS 打开', 'err');
     return;
   }
   const id = Date.now();
@@ -1254,9 +1329,14 @@ function startSurvey() {
   state.surveyTimer = setInterval(updateSurveyUI, 5000);
   els.surveyBtn.textContent = '结束巡测';
   els.surveyBtn.classList.add('on');
+  els.survey.classList.add('on');
   refreshWeather(false);
   updateSurveyUI();
+  showToast('巡测已开始：走动中每隔约 45 秒评一次气味', 'ok');
   setWarn('巡测开始：走动中每隔约 45 秒评一次气味，感到明显变化也可随时提交。');
+  if (navigator.vibrate) {
+    try { navigator.vibrate([60, 40, 60]); } catch (_) { /* 忽略 */ }
+  }
 }
 
 function stopSurvey() {
@@ -1280,10 +1360,14 @@ function stopSurvey() {
   state.survey = null;
   els.surveyBtn.textContent = '开始巡测';
   els.surveyBtn.classList.remove('on');
+  els.survey.classList.remove('on');
+  els.surveyBanner.classList.add('hidden');
   els.surveyText.classList.remove('due');
   els.surveyText.textContent = `巡测结束：共记录 ${pts.length} 个点` +
     (g && g.brg != null ? '，气味增强方向见地图箭头' : '');
   renderGradient(g, pts);
+  saveSession();
+  showToast(`巡测已结束：共记录 ${pts.length} 个点`, 'ok');
 }
 
 /* ---------------- 导出 ---------------- */
@@ -1295,52 +1379,147 @@ function dateStamp() {
     `${p(d.getHours())}${p(d.getMinutes())}`;
 }
 
-function downloadText(filename, text, mime) {
-  try {
-    const blob = new Blob([text], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => {
-      URL.revokeObjectURL(url);
-      a.remove();
-    }, 1500);
-  } catch (e) {
-    setWarn('导出失败：' + e.message, true);
-  }
+function triggerDownload(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 1200);
+}
+
+/* 生成文件并触发下载；同时保存内容，供「再次下载 / 复制」兜底 */
+function downloadText(filename, text, mime, label) {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  state.lastExport = { filename, text, mime, label: label || '导出内容', url };
+  triggerDownload(url, filename);
+  // 移动端下载可能延迟取走 blob，稍后再释放
+  setTimeout(() => {
+    try { URL.revokeObjectURL(url); } catch (_) { /* 忽略 */ }
+  }, 120000);
+  return state.lastExport;
+}
+
+function exportHint(msg) {
+  return msg + (IS_WECHAT
+    ? ' 微信内置浏览器可能拦截下载：请点右上角「…」选择在浏览器打开，或点「复制内容」。'
+    : ' 如果没看到下载提示，可点「再次下载」，或「复制内容」粘贴到 Excel/WPS。');
 }
 
 function exportRecordsCsv() {
   if (!state.records.length) {
+    showExportNote('还没有记录可导出。先定位并提交至少一条嗅辨记录。', true);
+    showToast('没有记录可导出', 'err');
     setWarn('还没有记录可导出。');
     return;
   }
-  downloadText(`odor_records_${dateStamp()}.csv`,
-    EXPORTERS.recordsToCsv(state.records), 'text/csv;charset=utf-8');
-  setWarn(`已导出 ${state.records.length} 条记录（CSV，WGS-84 坐标）。`);
+  try {
+    const filename = `odor_records_${dateStamp()}.csv`;
+    downloadText(filename, EXPORTERS.recordsToCsv(state.records),
+      'text/csv;charset=utf-8', 'CSV');
+    showExportNote(`已生成 CSV（${state.records.length} 条记录）。` + exportHint(''));
+    showToast(`已生成 CSV：${state.records.length} 条记录`, 'ok');
+    setWarn(`已导出 ${state.records.length} 条记录（CSV，WGS-84 坐标）。`);
+  } catch (e) {
+    showExportNote('导出失败：' + e.message, true);
+    showToast('导出失败：' + e.message, 'err');
+  }
 }
 
 function exportGeoJson() {
   if (!state.records.length) {
+    showExportNote('还没有记录可导出。先定位并提交至少一条嗅辨记录。', true);
+    showToast('没有记录可导出', 'err');
     setWarn('还没有记录可导出。');
     return;
   }
-  const g = state.lastSurvey ? state.lastSurvey.gradient
-    : (state.survey ? state.survey.gradient : null);
-  const ref = state.lastSurvey ? state.lastSurvey
-    : (state.survey && state.lat != null ? { lat: state.lat, lon: state.lon } : null);
-  let extra = null;
-  if (g && g.brg != null && ref &&
-      Number.isFinite(ref.lat) && Number.isFinite(ref.lon)) {
-    extra = { gradient: g, lat: ref.lat, lon: ref.lon };
+  try {
+    const g = state.lastSurvey ? state.lastSurvey.gradient
+      : (state.survey ? state.survey.gradient : null);
+    const ref = state.lastSurvey ? state.lastSurvey
+      : (state.survey && state.lat != null ? { lat: state.lat, lon: state.lon } : null);
+    let extra = null;
+    if (g && g.brg != null && ref &&
+        Number.isFinite(ref.lat) && Number.isFinite(ref.lon)) {
+      extra = { gradient: g, lat: ref.lat, lon: ref.lon };
+    }
+    const filename = `odor_survey_${dateStamp()}.geojson`;
+    downloadText(filename,
+      EXPORTERS.recordsToGeoJson(state.records, state.fusion, extra),
+      'application/geo+json;charset=utf-8', 'GeoJSON');
+    showExportNote(`已生成 GeoJSON（${state.records.length} 条记录 + 融合结果）。` +
+      exportHint(''));
+    showToast('已生成 GeoJSON 文件', 'ok');
+    setWarn(`已导出 ${state.records.length} 条记录和融合结果（GeoJSON）。`);
+  } catch (e) {
+    showExportNote('导出失败：' + e.message, true);
+    showToast('导出失败：' + e.message, 'err');
   }
-  downloadText(`odor_survey_${dateStamp()}.geojson`,
-    EXPORTERS.recordsToGeoJson(state.records, state.fusion, extra),
-    'application/geo+json;charset=utf-8');
-  setWarn(`已导出 ${state.records.length} 条记录和融合结果（GeoJSON）。`);
+}
+
+/* 下载被拦截时的兜底：再点一次，或复制到剪贴板 */
+function retryExport() {
+  const x = state.lastExport;
+  if (!x) {
+    showExportNote('还没有生成可下载的文件，请先点「导出 CSV / GeoJSON」。', true);
+    return;
+  }
+  try {
+    let url = x.url;
+    if (!url) {
+      url = URL.createObjectURL(new Blob([x.text], { type: x.mime }));
+      x.url = url;
+    }
+    triggerDownload(url, x.filename);
+    showToast('已再次触发下载：' + x.filename, 'ok');
+  } catch (e) {
+    showExportNote('再次下载失败：' + e.message, true);
+    showToast('再次下载失败', 'err');
+  }
+}
+
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.top = '-1000px';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+  ta.remove();
+  if (!ok) throw new Error('浏览器不允许复制');
+}
+
+async function copyExport() {
+  const x = state.lastExport;
+  if (!x) {
+    showExportNote('还没有生成可复制的内容，请先点「导出 CSV / GeoJSON」。', true);
+    return;
+  }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(x.text);
+    } else {
+      fallbackCopy(x.text);
+    }
+    showExportNote(`已复制 ${x.label} 内容（${x.text.length} 字符），可直接粘贴到 Excel/WPS。`);
+    showToast('已复制到剪贴板', 'ok', 3000);
+  } catch (_) {
+    try {
+      fallbackCopy(x.text);
+      showExportNote(`已复制 ${x.label} 内容，可直接粘贴到 Excel/WPS。`);
+      showToast('已复制到剪贴板', 'ok', 3000);
+    } catch (e2) {
+      showExportNote('复制失败：' + e2.message + '。请用「再次下载」或换浏览器打开。', true);
+      showToast('复制失败', 'err');
+    }
+  }
 }
 
 function saveEvals() {
@@ -1351,12 +1530,22 @@ function saveEvals() {
 
 function exportEvalsCsv() {
   if (!state.evals.length) {
+    showExportNote('还没有对照评估结果。先在「评估模式」里选真值并计算一次。', true);
+    showToast('没有评估结果可导出', 'err');
     setWarn('还没有对照评估结果可导出。');
     return;
   }
-  downloadText(`odor_eval_${dateStamp()}.csv`,
-    EXPORTERS.evalsToCsv(state.evals), 'text/csv;charset=utf-8');
-  setWarn(`已导出 ${state.evals.length} 次评估结果。`);
+  try {
+    const filename = `odor_eval_${dateStamp()}.csv`;
+    downloadText(filename, EXPORTERS.evalsToCsv(state.evals),
+      'text/csv;charset=utf-8', '评估 CSV');
+    showExportNote(`已生成评估 CSV（${state.evals.length} 次对照）。` + exportHint(''));
+    showToast(`已生成评估 CSV：${state.evals.length} 次`, 'ok');
+    setWarn(`已导出 ${state.evals.length} 次评估结果。`);
+  } catch (e) {
+    showExportNote('导出失败：' + e.message, true);
+    showToast('导出失败：' + e.message, 'err');
+  }
 }
 
 /* ---------------- 对照实验（真值评估） ---------------- */
@@ -1519,6 +1708,8 @@ els.fusionFocus.addEventListener('click', focusFusion);
 els.surveyBtn.addEventListener('click', startSurvey);
 els.exportCsv.addEventListener('click', exportRecordsCsv);
 els.exportGeo.addEventListener('click', exportGeoJson);
+els.exportRetry.addEventListener('click', retryExport);
+els.exportCopy.addEventListener('click', copyExport);
 els.evalToggle.addEventListener('click', toggleEvalPanel);
 els.evalPick.addEventListener('click', startEvalPick);
 els.evalRun.addEventListener('click', runEvaluation);

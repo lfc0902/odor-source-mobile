@@ -22,6 +22,11 @@
   <button id="btnLocate" class="chip">重新定位</button>
 </header>
 
+<div id="surveyBanner" class="survey-banner hidden" role="status" aria-live="polite">
+  <span class="pulse-dot"></span>
+  <span id="surveyBannerText" class="survey-banner-text">巡测中</span>
+</div>
+
 <section id="sheet">
   <div class="sheet-handle"></div>
 
@@ -85,6 +90,13 @@
       <button id="btnExportGeo" class="ghost small">导出 GeoJSON</button>
       <button id="btnEvalToggle" class="ghost small">评估模式</button>
     </div>
+    <div id="exportNote" class="export-note hidden" aria-live="polite">
+      <div id="exportNoteText"></div>
+      <div class="tools-row export-actions">
+        <button id="btnExportRetry" class="ghost small">再次下载</button>
+        <button id="btnExportCopy" class="ghost small">复制内容</button>
+      </div>
+    </div>
     <div id="evalPanel" class="eval-panel hidden">
       <div class="eval-hint">
         对照实验：先在地图上点选已知的真实源位置，再计算模型概率区域是否命中。
@@ -108,6 +120,8 @@
     <span class="hint">扇形 = 可能的来源方向（粗略，上风向）</span>
   </div>
 </section>
+
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
 <script src="vendor/leaflet/leaflet.js"></script>
 <script src="js/geo.js"></script>
