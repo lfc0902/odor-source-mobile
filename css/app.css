@@ -102,7 +102,9 @@ html, body {
 
 .status { margin-bottom: 10px; }
 .status-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.loc { font-size: 13px; color: var(--text); }
+.loc { font-size: 13px; color: var(--text); line-height: 1.5; flex: 1; min-width: 0; }
+.loc.poor { color: #fbbf24; }
+.ghost.on { color: var(--accent); border-color: var(--accent); }
 .weather { font-size: 13px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
 .weather b { color: var(--text); font-weight: 600; }
 .weather .src { font-size: 11px; opacity: .75; }

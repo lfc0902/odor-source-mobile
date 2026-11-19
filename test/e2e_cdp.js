@@ -244,8 +244,42 @@ async function shot(cdp, filename) {
       return JSON.stringify(res);
     })()`));
 
+    // 低精度定位：应明确提示「精度较低」并引导手动校正
+    await cdp.send('Emulation.setGeolocationOverride', {
+      latitude: 39.9042, longitude: 116.4074, accuracy: 500,
+    });
+    await evalJs(cdp, 'locate(); true');
+    await sleep(1200);
+    report.poorAccuracy = JSON.parse(await evalJs(cdp,
+      'JSON.stringify({text:document.getElementById("locText").innerText,' +
+      'poor:document.getElementById("locText").classList.contains("poor")})'));
+    await evalJs(cdp, 'stopGeoWatch(); true');
+
+    // 位置校准：点地图真实位置 → 保存本机偏移 → 新 GPS 自动套用 → 可清除
+    report.calibration = JSON.parse(await evalJs(cdp, `(() => {
+      toggleCalibration();
+      const started = state.calibrating;
+      const raw = state.lastRawFix;
+      const g = wgs84ToGcj02(raw.lat + 0.0027, raw.lon); // 真实位置在 GPS 以北约 300 m
+      map.fire('click', { latlng: L.latLng(g[0], g[1]) });
+      const saved = localStorage.getItem('odor_calib_v1');
+      const d = state.calib;
+      applyFix(raw.lat, raw.lon, 20); // 下一次 GPS 应自动套用偏移
+      const text = document.getElementById('locText').innerText;
+      toggleCalibration(); // 清除
+      return JSON.stringify({
+        started,
+        saved: saved ? JSON.parse(saved) : null,
+        dLat: d && d.dLat, dLon: d && d.dLon,
+        text,
+        cleared: state.calib,
+        lsAfter: localStorage.getItem('odor_calib_v1'),
+        btn: document.getElementById('btnCalib').textContent,
+      });
+    })()`));
+
     // 地图点击 → GCJ-02 反算为 WGS-84
-    const { gcj02ToWgs84 } = require('../js/coords.js');
+    const { gcj02ToWgs84, wgs84ToGcj02 } = require('../js/coords.js');
     await evalJs(cdp, 'map.fire("click", {latlng: L.latLng(39.9070, 116.4130)}); true');
     await sleep(400);
     const got = JSON.parse(await evalJs(cdp, 'JSON.stringify({lat:state.lat, lon:state.lon})'));
@@ -253,6 +287,16 @@ async function shot(cdp, filename) {
     report.clickInverseOk =
       Math.abs(got.lat - exp[0]) < 1e-6 && Math.abs(got.lon - exp[1]) < 1e-6;
     report.clickInverse = { got, expected: { lat: exp[0], lon: exp[1] } };
+
+    // 坐标基准自检：天安门 WGS-84 转换后应落在高德图上的天安门
+    const tam = wgs84ToGcj02(39.908692, 116.397477);
+    await evalJs(cdp,
+      `map.setView([${tam[0] - 0.0015}, ${tam[1]}], 17); ` +
+      `L.circleMarker([${tam[0]}, ${tam[1]}], {radius:8,color:'#ffdd00',weight:3,` +
+      `fillColor:'#ffdd00',fillOpacity:1}).addTo(map); true`);
+    await sleep(3000);
+    await shot(cdp, '_e2e_landmark.png');
+    report.landmarkGcj = { lat: tam[0], lon: tam[1] };
 
     ws.close();
   } finally {

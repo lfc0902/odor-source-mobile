@@ -31,7 +31,24 @@ const state = {
   selectedLevel: null,
   records: [],
   seq: 0,
+  calib: null,        // 本机定位系统偏移（设备坐标系不是 WGS-84 时用）
+  lastRawFix: null,   // 最近一次原始 GPS（未经校准）
+  calibrating: false,
 };
+
+const CALIB_KEY = 'odor_calib_v1';
+
+function loadCalib() {
+  try {
+    const v = JSON.parse(localStorage.getItem(CALIB_KEY) || 'null');
+    if (v && Number.isFinite(v.dLat) && Number.isFinite(v.dLon) &&
+        Math.abs(v.dLat) < 0.05 && Math.abs(v.dLon) < 0.05) {
+      return v;
+    }
+  } catch (_) { /* 隐私模式等 */ }
+  return null;
+}
+state.calib = loadCalib();
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -51,6 +68,8 @@ const els = {
   mwDir: $('mwDir'),
   mwSpd: $('mwSpd'),
   mwApply: $('mwApply'),
+  calib: $('btnCalib'),
+  envHint: $('envHint'),
 };
 
 /* ---------------- 地图 ---------------- */
@@ -177,6 +196,105 @@ function describeGeoError(err) {
   return '定位失败，可点击地图手动设置位置。';
 }
 
+let geoWatch = null;
+let geoTimer = null;
+let geoBest = null;
+let geoFirstFix = false;
+
+function stopGeoWatch() {
+  if (geoWatch != null) {
+    navigator.geolocation.clearWatch(geoWatch);
+    geoWatch = null;
+  }
+  if (geoTimer) {
+    clearTimeout(geoTimer);
+    geoTimer = null;
+  }
+}
+
+/** 实时落点：只更新位置显示与标记，不重复请求天气 */
+function applyFix(lat, lon, acc) {
+  state.lastRawFix = { lat, lon, acc: acc == null ? null : acc };
+  const c = state.calib;
+  const plat = lat + (c ? c.dLat : 0);
+  const plon = lon + (c ? c.dLon : 0);
+  state.lat = plat;
+  state.lon = plon;
+  state.accuracy = acc == null ? null : acc;
+  state.manualLocation = false;
+  setCurrentMarker(plat, plon, state.accuracy);
+  const poor = state.accuracy != null && state.accuracy > 100;
+  els.loc.textContent =
+    `位置 ${plat.toFixed(5)}, ${plon.toFixed(5)}` +
+    (state.accuracy != null
+      ? `（±${Math.round(state.accuracy)} m${poor ? '，精度较低，可点地图校正' : ''}）`
+      : '') +
+    (c ? ' · 已校准' : '');
+  els.loc.classList.toggle('poor', poor);
+  updateSubmitState();
+}
+
+function updateCalibButton() {
+  els.calib.textContent = state.calib ? '清除校准' : '校准';
+  els.calib.classList.toggle('on', state.calibrating);
+}
+
+/** 用地图点校正本机 GPS 的系统性偏移，并记住 */
+function toggleCalibration() {
+  if (state.calibrating) {
+    state.calibrating = false;
+    updateCalibButton();
+    setWarn('已取消校准。');
+    return;
+  }
+  if (state.calib) {
+    state.calib = null;
+    try { localStorage.removeItem(CALIB_KEY); } catch (_) { /* 忽略 */ }
+    state.calibrating = false;
+    updateCalibButton();
+    if (state.lastRawFix) {
+      applyFix(state.lastRawFix.lat, state.lastRawFix.lon, state.lastRawFix.acc);
+      refreshWeather(true);
+    }
+    setWarn('已清除位置校准。');
+    return;
+  }
+  if (!state.lastRawFix) {
+    setWarn('请先点「重新定位」拿到 GPS 位置，再点校准。', true);
+    return;
+  }
+  state.calibrating = true;
+  updateCalibButton();
+  setWarn('校准：请在地图上点一下你此刻的真实位置。', true);
+}
+
+function applyCalibration(tLat, tLon) {
+  const raw = state.lastRawFix;
+  if (!raw) {
+    state.calibrating = false;
+    updateCalibButton();
+    setWarn('没有可用的 GPS 基准，请先重新定位。', true);
+    return;
+  }
+  const dLat = tLat - raw.lat;
+  const dLon = tLon - raw.lon;
+  const dist = Math.hypot(
+    dLat * 111320,
+    dLon * 111320 * Math.cos(tLat * Math.PI / 180)
+  );
+  if (dist > 3000) {
+    setWarn(`点选位置与 GPS 相差约 ${Math.round(dist)} 米，偏差过大，未保存。请确认点的是你当前实际位置。`, true);
+    return;
+  }
+  state.calib = { dLat, dLon };
+  try { localStorage.setItem(CALIB_KEY, JSON.stringify(state.calib)); } catch (_) { /* 忽略 */ }
+  state.calibrating = false;
+  updateCalibButton();
+  applyFix(raw.lat, raw.lon, raw.acc);
+  refreshWeather(true);
+  setWarn(`已校准：本机定位偏差约 ${Math.round(dist)} 米，之后会自动修正。`);
+}
+
 function locate() {
   clearWarn();
   if (!navigator.geolocation) {
@@ -190,19 +308,49 @@ function locate() {
     );
     return;
   }
-  els.loc.textContent = '正在定位…';
-  navigator.geolocation.getCurrentPosition(
-    (pos) => {
-      const { latitude, longitude, accuracy } = pos.coords;
-      state.manualLocation = false;
-      setLocation(latitude, longitude, accuracy);
-    },
-    (err) => {
+
+  // 连续采样最多 8 秒，取最准的一次；精度 ≤20 m 时提前结束
+  stopGeoWatch();
+  geoBest = null;
+  geoFirstFix = false;
+  els.loc.textContent = '正在定位（提高精度中…）';
+
+  const onPos = (pos) => {
+    const { latitude, longitude, accuracy } = pos.coords;
+    const acc = accuracy == null ? null : accuracy;
+    if (!geoBest || (acc != null && (geoBest.acc == null || acc < geoBest.acc))) {
+      geoBest = { lat: latitude, lon: longitude, acc };
+    }
+    applyFix(latitude, longitude, acc);
+    if (!geoFirstFix) {
+      geoFirstFix = true;
+      refreshWeather(true); // 第一次拿到位置就取当地天气
+    }
+    if (acc != null && acc <= 20) stopGeoWatch();
+  };
+
+  const onErr = (err) => {
+    stopGeoWatch();
+    if (geoBest) return; // 已经拿到位置就不打断
+    els.loc.textContent = '未获取到定位';
+    setWarn(describeGeoError(err), true);
+  };
+
+  geoWatch = navigator.geolocation.watchPosition(onPos, onErr, {
+    enableHighAccuracy: true,
+    timeout: 15000,
+    maximumAge: 0, // 不使用缓存位置，避免拿到几分钟前的旧点
+  });
+
+  geoTimer = setTimeout(() => {
+    stopGeoWatch();
+    if (geoBest) {
+      applyFix(geoBest.lat, geoBest.lon, geoBest.acc);
+    } else {
       els.loc.textContent = '未获取到定位';
-      setWarn(describeGeoError(err), true);
-    },
-    { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 }
-  );
+      setWarn('定位超时，可点击地图手动设置位置。', true);
+    }
+  }, 8000);
 }
 
 function setLocation(lat, lon, acc, manual = false) {
@@ -215,6 +363,7 @@ function setLocation(lat, lon, acc, manual = false) {
     `位置 ${lat.toFixed(5)}, ${lon.toFixed(5)}` +
     (state.accuracy ? `（±${Math.round(state.accuracy)} m）` : '') +
     (manual ? ' · 手动标点' : '');
+  els.loc.classList.remove('poor');
   updateSubmitState();
   refreshWeather(true);
 }
@@ -518,9 +667,14 @@ els.submit.addEventListener('click', addRecord);
 els.clear.addEventListener('click', clearAll);
 els.manualBtn.addEventListener('click', () => els.manual.classList.toggle('hidden'));
 els.mwApply.addEventListener('click', applyManualWind);
+els.calib.addEventListener('click', toggleCalibration);
 
 map.on('click', (e) => {
   const [lat, lon] = gcj02ToWgs84(e.latlng.lat, e.latlng.lng);
+  if (state.calibrating) {
+    applyCalibration(lat, lon);
+    return;
+  }
   setLocation(lat, lon, null, true);
 });
 
@@ -529,6 +683,14 @@ map.on('click', (e) => {
 renderLevelButtons();
 renderRecords();
 updateSubmitState();
+updateCalibButton();
+
+if (/MicroMessenger/i.test(navigator.userAgent)) {
+  els.envHint.textContent =
+    '当前在微信内打开，定位可能偏差较大。请点右上角「…」选择「在浏览器打开」，' +
+    '并允许「精确位置」。';
+  els.envHint.classList.remove('hidden');
+}
 
 if (!window.isSecureContext) {
   setWarn(

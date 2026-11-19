@@ -1,7 +1,7 @@
 /* 离线壳：缓存页面与静态资源；天气和地图瓦片仍走网络 */
 'use strict';
 
-const CACHE = 'odor-mvp-v5';
+const CACHE = 'odor-mvp-v6';
 const ASSETS = [
   './',
   'index.html',
