@@ -46,6 +46,11 @@ const els = {
   locate: $('btnLocate'),
   refresh: $('btnRefresh'),
   clear: $('btnClear'),
+  manual: $('manual'),
+  manualBtn: $('btnManual'),
+  mwDir: $('mwDir'),
+  mwSpd: $('mwSpd'),
+  mwApply: $('mwApply'),
 };
 
 /* ---------------- 地图 ---------------- */
@@ -214,27 +219,82 @@ function setLocation(lat, lon, acc, manual = false) {
   refreshWeather(true);
 }
 
-/* ---------------- 天气（Open-Meteo，免 key） ---------------- */
+/* ---------------- 天气（Open-Meteo 主源 + wttr.in 备源 + 手动兜底） ---------------- */
 
-async function fetchWeather(lat, lon) {
+// wttr.in 的英文天气描述 → 中文
+const WTTR_CN = {
+  Sunny: '晴', Clear: '晴', 'Partly cloudy': '多云', Cloudy: '多云', Overcast: '阴',
+  Mist: '薄雾', Fog: '雾', Haze: '霾', 'Freezing fog': '冻雾',
+  'Light rain': '小雨', 'Moderate rain': '中雨', 'Heavy rain': '大雨',
+  'Light drizzle': '毛毛雨', 'Patchy light drizzle': '局部毛毛雨',
+  'Patchy rain possible': '局部有雨', 'Patchy light rain': '局部小雨',
+  'Light rain shower': '小阵雨', 'Moderate or heavy rain shower': '强阵雨',
+  'Thundery outbreaks possible': '可能有雷雨',
+  'Light snow': '小雪', 'Moderate snow': '中雪', 'Heavy snow': '大雪',
+  'Blizzard': '暴雪', 'Patchy snow possible': '局部有雪',
+  'Light freezing rain': '冻雨', 'Light sleet': '小雨夹雪', Sleet: '雨夹雪',
+};
+
+async function fetchJson(url, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchOpenMeteo(lat, lon) {
   const url =
     'https://api.open-meteo.com/v1/forecast' +
     `?latitude=${lat.toFixed(4)}&longitude=${lon.toFixed(4)}` +
     '&current=temperature_2m,relative_humidity_2m,wind_speed_10m,' +
     'wind_direction_10m,weather_code' +
     '&wind_speed_unit=ms&timezone=auto';
+  const data = await fetchJson(url, 8000);
+  if (!data.current) throw new Error('Open-Meteo 响应异常');
+  const c = data.current;
+  return {
+    source: 'Open-Meteo',
+    temperature_2m: c.temperature_2m,
+    relative_humidity_2m: c.relative_humidity_2m,
+    wind_speed_10m: c.wind_speed_10m,
+    wind_direction_10m: c.wind_direction_10m,
+    desc: WEATHER_CODES[c.weather_code] || '',
+  };
+}
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    if (!data.current) throw new Error('响应缺少 current 字段');
-    return data.current;
-  } finally {
-    clearTimeout(timer);
+async function fetchWttr(lat, lon) {
+  const url = `https://wttr.in/${lat.toFixed(4)},${lon.toFixed(4)}?format=j1`;
+  const data = await fetchJson(url, 12000);
+  const c = data.current_condition && data.current_condition[0];
+  if (!c) throw new Error('wttr.in 响应异常');
+  const kmph = Number(c.windspeedKmph);
+  const desc = c.weatherDesc && c.weatherDesc[0] && c.weatherDesc[0].value;
+  return {
+    source: 'wttr.in',
+    temperature_2m: c.temp_C != null ? Number(c.temp_C) : null,
+    relative_humidity_2m: c.humidity != null ? Number(c.humidity) : null,
+    wind_speed_10m: Number.isFinite(kmph) ? kmph / 3.6 : null,
+    wind_direction_10m: c.winddirDegree != null ? Number(c.winddirDegree) : null,
+    desc: desc ? (WTTR_CN[desc] || desc) : '',
+  };
+}
+
+/** 依次尝试数据源，任一成功即返回 */
+async function fetchWeather(lat, lon) {
+  const errors = [];
+  for (const fn of [fetchOpenMeteo, fetchWttr]) {
+    try {
+      return await fn(lat, lon);
+    } catch (e) {
+      errors.push(e.message);
+    }
   }
+  throw new Error(errors.join(' / '));
 }
 
 async function refreshWeather(force = false) {
@@ -250,14 +310,14 @@ async function refreshWeather(force = false) {
     state.weather = null;
     state.weatherAt = 0;
     els.weather.textContent = '气象获取失败';
-    setWarn(`天气接口失败（${e.message}），请检查网络后点「刷新天气」。`, true);
+    els.manual.classList.remove('hidden');
+    setWarn(`天气接口失败（${e.message}）。可点「手动」输入风向风速。`, true);
   }
 }
 
 function renderWeather(cur) {
   const parts = [];
-  const codeText = WEATHER_CODES[cur.weather_code] || '';
-  if (codeText) parts.push(codeText);
+  if (cur.desc) parts.push(cur.desc);
 
   const ws = cur.wind_speed_10m;
   const wd = cur.wind_direction_10m;
@@ -268,13 +328,40 @@ function renderWeather(cur) {
   }
   if (cur.temperature_2m != null) parts.push(`气温 ${cur.temperature_2m.toFixed(1)}°C`);
   if (cur.relative_humidity_2m != null) parts.push(`湿度 ${Math.round(cur.relative_humidity_2m)}%`);
-  els.weather.innerHTML = parts.join(' · ');
+  const src = cur.source ? ` <span class="src">（${cur.source}）</span>` : '';
+  els.weather.innerHTML = parts.join(' · ') + src;
 
   if (ws != null && ws < 0.5) {
     setWarn('当前风速过小（<0.5 m/s），风向参考性差，溯源结果可靠性下降。', true);
   } else {
     clearWarn();
   }
+}
+
+function applyManualWind() {
+  const dir = Number(els.mwDir.value);
+  const spd = Number(els.mwSpd.value);
+  if (!Number.isFinite(dir) || dir < 0 || dir > 359) {
+    setWarn('请输入有效的风向：0–359°（气象风向 = 风的来向）。');
+    return;
+  }
+  if (!Number.isFinite(spd) || spd < 0) {
+    setWarn('请输入有效的风速（m/s）。');
+    return;
+  }
+  const w = {
+    source: '手动输入',
+    temperature_2m: null,
+    relative_humidity_2m: null,
+    wind_speed_10m: spd,
+    wind_direction_10m: dir,
+    desc: '',
+  };
+  state.weather = w;
+  state.weatherAt = Date.now();
+  renderWeather(w);
+  clearWarn();
+  els.manual.classList.add('hidden');
 }
 
 /* ---------------- 提交与绘制 ---------------- */
@@ -429,6 +516,8 @@ els.locate.addEventListener('click', locate);
 els.refresh.addEventListener('click', () => refreshWeather(true));
 els.submit.addEventListener('click', addRecord);
 els.clear.addEventListener('click', clearAll);
+els.manualBtn.addEventListener('click', () => els.manual.classList.toggle('hidden'));
+els.mwApply.addEventListener('click', applyManualWind);
 
 map.on('click', (e) => {
   const [lat, lon] = gcj02ToWgs84(e.latlng.lat, e.latlng.lng);

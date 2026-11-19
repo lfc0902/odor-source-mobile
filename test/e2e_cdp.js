@@ -10,8 +10,9 @@ const path = require('path');
 
 const EDGE = process.env.EDGE_BIN ||
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-const PORT = 9333;
-const BASE = 'http://127.0.0.1:8123/';
+// 每次用独立端口：避免连到上一次没退干净的 headless 实例（会跑旧代码）
+const PORT = 9300 + Math.floor(Math.random() * 500);
+const BASE = process.env.BASE_URL || 'http://127.0.0.1:8123/';
 const ROOT = path.join(__dirname, '..');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -97,57 +98,91 @@ async function shot(cdp, filename) {
 
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable');
+    await cdp.send('Network.enable');
+    // 自测时禁用缓存与 Service Worker，确保跑的是磁盘上的最新代码
+    await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
+    try { await cdp.send('Network.setBypassServiceWorker', { bypass: true }); } catch (_) {}
     await cdp.send('Emulation.setDeviceMetricsOverride', {
       width: 390, height: 844, deviceScaleFactor: 2, mobile: true,
     });
-    await cdp.send('Page.navigate', { url: BASE });
+    await cdp.send('Page.navigate', { url: BASE + (BASE.includes('?') ? '&' : '?') + 't=' + Date.now() });
     await sleep(2500);
 
     report.viewport = await evalJs(cdp, 'innerWidth + "x" + innerHeight');
     report.leafletLoaded = await evalJs(cdp, 'typeof L !== "undefined"');
     report.levelsCount = await evalJs(cdp, 'document.querySelectorAll(".level-btn").length');
+    // 新代码断言：备源与手动风速必须存在
+    report.hasWttr = await evalJs(cdp, 'typeof fetchWttr === "function"');
+    report.hasManual = await evalJs(cdp, 'typeof applyManualWind === "function"');
 
     // 注入 GPS（绕过 headless 无法授权定位）
     await evalJs(cdp, 'setLocation(39.9042, 116.4074, 15); true');
 
-    // 等待真实天气返回
+    // 等待真实天气返回（Open-Meteo 8s → wttr.in 12s，最长约 20s；给到 32s）
     let weather = null;
-    for (let i = 0; i < 50; i++) {
-      weather = await evalJs(cdp, 'state.weather ? JSON.stringify(state.weather) : null');
+    for (let i = 0; i < 80; i++) {
+      weather = await evalJs(cdp,
+        'state.weather && state.weather.source ? JSON.stringify(state.weather) : null');
       if (weather) break;
       await sleep(400);
     }
-    if (!weather) throw new Error('天气 API 未返回');
-    report.weather = JSON.parse(weather);
+    report.weatherOk = !!weather;
+    report.weather = weather ? JSON.parse(weather) : null;
+    report.weatherSource = weather ? JSON.parse(weather).source : null;
     report.weatherText = await evalJs(cdp, 'document.getElementById("weatherText").innerText');
     await shot(cdp, '_e2e_before.png');
 
-    // 选等级 4 并提交
-    report.submitDisabledBefore = await evalJs(cdp, 'document.getElementById("btnSubmit").disabled');
-    await evalJs(cdp, 'selectLevel(4); addRecord(); true');
-    await sleep(3000);
+    // 真实天气路径：选等级 4 并提交（两个气象源都挂时跳过，下面用「手动」兜底验证）
+    if (weather) {
+      report.submitDisabledBefore = await evalJs(cdp, 'document.getElementById("btnSubmit").disabled');
+      await evalJs(cdp, 'selectLevel(4); addRecord(); true');
+      await sleep(3000);
 
-    report.records = await evalJs(cdp, 'state.records.length');
-    report.summary = await evalJs(cdp, 'document.getElementById("summary").innerText');
-    report.sectorBounds = await evalJs(cdp,
-      'JSON.stringify(state.records[0].sector.getBounds())');
-    report.estCircleRadius = await evalJs(cdp, 'state.records[0].estCircle.getRadius()');
-    report.mapZoom = await evalJs(cdp, 'map.getZoom()');
-    report.mapCenter = await evalJs(cdp, 'JSON.stringify(map.getCenter())');
-    report.sheetHeight = await evalJs(cdp, 'document.getElementById("sheet").offsetHeight');
-    report.sectorOnMap = await evalJs(cdp, 'map.hasLayer(state.records[0].sector)');
-    report.sectorPixelBounds = await evalJs(cdp,
-      'JSON.stringify((()=>{const b=state.records[0].sector.getBounds();' +
-      'return {sw:map.latLngToContainerPoint(b.getSouthWest()),' +
-      'ne:map.latLngToContainerPoint(b.getNorthEast())}})())');
-    // 方位约定自检：气象风向 = 污染源方位（上风向）
-    report.bearingEqualsWindDir = await evalJs(cdp,
-      'state.records[0].bearing === state.weather.wind_direction_10m');
-    await shot(cdp, '_e2e_after.png');
+      report.records = await evalJs(cdp, 'state.records.length');
+      report.summary = await evalJs(cdp, 'document.getElementById("summary").innerText');
+      report.sectorBounds = await evalJs(cdp,
+        'JSON.stringify(state.records[0].sector.getBounds())');
+      report.estCircleRadius = await evalJs(cdp, 'state.records[0].estCircle.getRadius()');
+      report.mapZoom = await evalJs(cdp, 'map.getZoom()');
+      report.mapCenter = await evalJs(cdp, 'JSON.stringify(map.getCenter())');
+      report.sheetHeight = await evalJs(cdp, 'document.getElementById("sheet").offsetHeight');
+      report.sectorOnMap = await evalJs(cdp, 'map.hasLayer(state.records[0].sector)');
+      report.sectorPixelBounds = await evalJs(cdp,
+        'JSON.stringify((()=>{const b=state.records[0].sector.getBounds();' +
+        'return {sw:map.latLngToContainerPoint(b.getSouthWest()),' +
+        'ne:map.latLngToContainerPoint(b.getNorthEast())}})())');
+      // 方位约定自检：气象风向 = 污染源方位（上风向）
+      report.bearingEqualsWindDir = await evalJs(cdp,
+        'state.records[0].bearing === state.weather.wind_direction_10m');
+      await shot(cdp, '_e2e_after.png');
 
-    // 清除
+      // 清除
+      await evalJs(cdp, 'clearAll(); true');
+      report.recordsAfterClear = await evalJs(cdp, 'state.records.length');
+    }
+
+    // 手动风向 / 风速路径（气象源全部失败时的兜底）
+    const manual = await evalJs(cdp, `(() => {
+      document.getElementById('mwDir').value = '90';
+      document.getElementById('mwSpd').value = '3.2';
+      applyManualWind();
+      const src = state.weather && state.weather.source;
+      const txt = document.getElementById('weatherText').innerText;
+      selectLevel(3);
+      addRecord();
+      const r = state.records[state.records.length - 1];
+      return JSON.stringify({
+        source: src, text: txt,
+        bearing: r && r.bearing, windSpeed: r && r.windSpeed,
+        records: state.records.length,
+        manualHidden: document.getElementById('manual').classList.contains('hidden'),
+        summary: document.getElementById('summary').innerText,
+      });
+    })()`);
+    report.manual = JSON.parse(manual);
+    await shot(cdp, '_e2e_manual.png');
     await evalJs(cdp, 'clearAll(); true');
-    report.recordsAfterClear = await evalJs(cdp, 'state.records.length');
+    report.recordsAfterManualClear = await evalJs(cdp, 'state.records.length');
 
     // 地图点击 → GCJ-02 反算为 WGS-84
     const { gcj02ToWgs84 } = require('../js/coords.js');
@@ -161,7 +196,11 @@ async function shot(cdp, filename) {
 
     ws.close();
   } finally {
-    child.kill();
+    // Edge 会派生子进程，child.kill() 杀不干净，会导致下次连到旧实例跑旧代码
+    try {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+    } catch (_) { /* 忽略 */ }
+    await sleep(500);
   }
 
   console.log(JSON.stringify(report, null, 2));

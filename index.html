@@ -28,9 +28,17 @@
   <div class="status">
     <div class="status-row">
       <span id="locText" class="loc">正在定位…</span>
-      <button id="btnRefresh" class="ghost small">刷新天气</button>
+      <span class="btns">
+        <button id="btnManual" class="ghost small">手动</button>
+        <button id="btnRefresh" class="ghost small">刷新天气</button>
+      </span>
     </div>
     <div id="weatherText" class="weather">—</div>
+    <div id="manual" class="manual hidden">
+      <label>风向<input id="mwDir" type="number" min="0" max="359" step="1" inputmode="numeric" placeholder="0-359°"></label>
+      <label>风速<input id="mwSpd" type="number" min="0" step="0.1" inputmode="decimal" placeholder="m/s"></label>
+      <button id="mwApply" class="ghost small">应用</button>
+    </div>
     <div id="warnText" class="warn hidden"></div>
   </div>
 
