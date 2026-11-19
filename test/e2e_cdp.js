@@ -3,7 +3,7 @@
  * 模拟手机视口 → 注入定位 → 真实调用 Open-Meteo → 选等级 → 提交 → 截图
  * 用法：先启动静态服务（8123），再 node test/e2e_cdp.js
  */
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -256,9 +256,15 @@ async function shot(cdp, filename) {
 
     ws.close();
   } finally {
-    // Edge 会派生子进程，child.kill() 杀不干净，会导致下次连到旧实例跑旧代码
+    // Edge 会派生子进程，child.kill()/taskkill 都可能杀不干净；
+    // 按测试专用 profile 前缀精确清理，否则残留实例会占端口、下次跑到旧代码
     try {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      spawnSync('powershell', ['-NoProfile', '-Command',
+        'Get-CimInstance Win32_Process -Filter "Name=\'msedge.exe\'" | ' +
+        'Where-Object { $_.CommandLine -match \'edge_e2e_\' } | ' +
+        'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }',
+      ], { stdio: 'ignore', timeout: 15000 });
     } catch (_) { /* 忽略 */ }
     await sleep(500);
   }
