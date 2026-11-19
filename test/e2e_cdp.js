@@ -115,8 +115,37 @@ async function shot(cdp, filename) {
     report.hasWttr = await evalJs(cdp, 'typeof fetchWttr === "function"');
     report.hasManual = await evalJs(cdp, 'typeof applyManualWind === "function"');
 
-    // 注入 GPS（绕过 headless 无法授权定位）
-    await evalJs(cdp, 'setLocation(39.9042, 116.4074, 15); true');
+    // 真实定位链路：授权 geolocation 并模拟 GPS，验证 HTTPS 下自动定位可用
+    let geoOk = false;
+    try {
+      await cdp.send('Browser.grantPermissions', {
+        origin: new URL(BASE).origin,
+        permissions: ['geolocation'],
+      });
+      await cdp.send('Emulation.setGeolocationOverride', {
+        latitude: 39.9042, longitude: 116.4074, accuracy: 15,
+      });
+      await evalJs(cdp, 'locate(); true');
+      for (let i = 0; i < 40; i++) {
+        const st = JSON.parse(await evalJs(cdp,
+          'JSON.stringify({lat:state.lat, lon:state.lon, manual:state.manualLocation})'));
+        if (st.lat != null && st.manual === false &&
+            Math.abs(st.lat - 39.9042) < 1e-6 && Math.abs(st.lon - 116.4074) < 1e-6) {
+          geoOk = true;
+          break;
+        }
+        await sleep(250);
+      }
+      report.geoLocate = JSON.parse(await evalJs(cdp,
+        'JSON.stringify({lat:state.lat, lon:state.lon, manual:state.manualLocation, secure:window.isSecureContext})'));
+    } catch (e) {
+      report.geoError = e.message;
+    }
+    report.geoOk = geoOk;
+    if (!geoOk) {
+      // 环境不支持定位模拟时退回直接注入，保证其余用例可跑
+      await evalJs(cdp, 'setLocation(39.9042, 116.4074, 15); true');
+    }
 
     // 等待真实天气返回（Open-Meteo 8s → wttr.in 12s，最长约 20s；给到 32s）
     let weather = null;
