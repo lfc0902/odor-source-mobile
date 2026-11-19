@@ -13,7 +13,11 @@ const CONFIG = {
   weatherMaxAgeMs: 10 * 60 * 1000,
   windHistoryHours: 6,       // 取近几小时逐时风评估稳定性
   surveyPromptMs: 45 * 1000, // 巡测时每隔多久提示再评一次
-  surveyTrailMinDist: 10,    // 巡测轨迹最小间距（米），过滤 GPS 抖动
+  surveyTrailMinDist: 12,    // 巡测轨迹最小间距（米），过滤 GPS 抖动
+  locateSampleMs: 20000,     // 首次定位最多连续采样多久（毫秒）
+  surveyMaxAcc: 60,          // 巡测记录允许的最大定位误差（米）
+  surveyStableMs: 10000,     // 巡测提交时用最近多少秒的定位点求稳健位置
+  gradientMinDist: 80,       // 气味梯度只比较间距 ≥ 此值的点对（米）
   // 气味等级 → 距污染源的大致距离区间（米）。经验值，均可调。
   levels: {
     1: { label: '勉强闻到', short: '勉强', near: 1500, far: 6000, color: '#38bdf8' },
@@ -84,6 +88,7 @@ function loadEvals() {
 state.evals = loadEvals();
 
 const { gradient: smellGradient, windStability, sigFromStability } = SURVEY;
+const { stableFix, plausible, gradeAccuracy } = GEOFIX;
 
 const IS_WECHAT = /MicroMessenger/i.test(navigator.userAgent);
 const $ = (id) => document.getElementById(id);
@@ -290,10 +295,35 @@ function describeGeoError(err) {
 
 let geoWatch = null;
 let geoTimer = null;
+let geoHintTimer = null;
 let geoBest = null;
 let geoFirstFix = false;
+let geoDone = false;
+let geoSession = 0; // 定位会话号：旧 watch/定时器回调不能覆盖新定位
+let fixBuf = []; // 最近定位点（已校准），用于稳健平均
+
+function clearFixBuffer() {
+  fixBuf = [];
+}
+
+function pushFix(lat, lon, acc) {
+  const t = Date.now();
+  fixBuf.push({ lat, lon, acc: acc == null ? null : Number(acc), t });
+  while (fixBuf.length > 150 || (fixBuf.length && t - fixBuf[0].t > 90000)) {
+    fixBuf.shift();
+  }
+}
+
+function accuracyText(acc) {
+  const q = gradeAccuracy(acc);
+  if (q === 'good') return `GPS 精度 ±${Math.round(acc)} m`;
+  if (q === 'ok') return `±${Math.round(acc)} m，精度一般`;
+  if (q === 'poor') return `±${Math.round(acc)} m，精度较低，可点地图校正`;
+  return '';
+}
 
 function stopGeoWatch() {
+  geoSession++; // 让已排队的旧回调失效
   if (geoWatch != null) {
     navigator.geolocation.clearWatch(geoWatch);
     geoWatch = null;
@@ -302,27 +332,35 @@ function stopGeoWatch() {
     clearTimeout(geoTimer);
     geoTimer = null;
   }
+  if (geoHintTimer) {
+    clearTimeout(geoHintTimer);
+    geoHintTimer = null;
+  }
 }
 
 /** 实时落点：只更新位置显示与标记，不重复请求天气 */
 function applyFix(lat, lon, acc) {
-  state.lastRawFix = { lat, lon, acc: acc == null ? null : acc };
+  const a = acc == null ? null : Number(acc);
+  state.lastRawFix = { lat, lon, acc: a };
   const c = state.calib;
   const plat = lat + (c ? c.dLat : 0);
   const plon = lon + (c ? c.dLon : 0);
   state.lat = plat;
   state.lon = plon;
-  state.accuracy = acc == null ? null : acc;
+  state.accuracy = a;
   state.manualLocation = false;
-  setCurrentMarker(plat, plon, state.accuracy);
-  const poor = state.accuracy != null && state.accuracy > 100;
+  state.lastFixAt = Date.now();
+  pushFix(plat, plon, a);
+  setCurrentMarker(plat, plon, a);
   els.loc.textContent =
     `位置 ${plat.toFixed(5)}, ${plon.toFixed(5)}` +
-    (state.accuracy != null
-      ? `（±${Math.round(state.accuracy)} m${poor ? '，精度较低，可点地图校正' : ''}）`
-      : '') +
+    (a != null ? `（${accuracyText(a)}）` : '') +
     (c ? ' · 已校准' : '');
-  els.loc.classList.toggle('poor', poor);
+  const q = gradeAccuracy(a);
+  els.loc.classList.remove('good', 'warn', 'poor');
+  if (q === 'good') els.loc.classList.add('good');
+  else if (q === 'ok') els.loc.classList.add('warn');
+  else if (q === 'poor') els.loc.classList.add('poor');
   updateSubmitState();
 }
 
@@ -401,15 +439,65 @@ function locate() {
     return;
   }
 
-  // 连续采样最多 8 秒，取最准的一次；精度 ≤20 m 时提前结束
+  // 连续采样最多 20 秒；拿到 3 个 ≤15 m 且彼此靠近的点就提前结束
   stopGeoWatch();
+  const session = ++geoSession;
   geoBest = null;
   geoFirstFix = false;
-  els.loc.textContent = '正在定位（提高精度中…）';
+  geoDone = false;
+  clearFixBuffer();
+  els.loc.textContent = '正在定位（提高精度中，最多约 20 秒）…';
+  els.loc.classList.remove('good', 'warn', 'poor');
+
+  const finish = (why, err) => {
+    if (session !== geoSession || geoDone) return;
+    geoDone = true;
+    stopGeoWatch();
+    const s = stableFix(fixBuf, Date.now(), {
+      windowMs: CONFIG.locateSampleMs + 1000,
+      maxAcc: 200,
+      maxSpread: 100,
+    });
+    if (s) {
+      applyFix(s.lat, s.lon, s.acc);
+      if (gradeAccuracy(s.acc) === 'poor') {
+        setWarn(
+          `当前定位精度只有 ±${Math.round(s.acc)} m，很可能是网络定位。` +
+          '请确认手机已开启「精确位置」和 GPS，到室外再点「重新定位」；也可点地图手动标点。',
+          true
+        );
+      } else {
+        setWarn(
+          `定位完成：${gradeAccuracy(s.acc) === 'good' ? '精度良好' : '精度一般'}` +
+          `（±${Math.round(s.acc)} m，${s.n} 个采样点）。`
+        );
+      }
+      return;
+    }
+    if (geoBest) {
+      applyFix(geoBest.lat, geoBest.lon, geoBest.acc);
+      setWarn(
+        '只拿到了低精度位置，可能是网络定位。请开启系统「精确位置」、到室外后再试，或点地图手动标点。',
+        true
+      );
+      return;
+    }
+    els.loc.textContent = '未获取到定位';
+    if (err) setWarn(describeGeoError(err), true);
+    else if (why === 'timeout') {
+      setWarn(
+        '定位超时：请点右上角「重新定位」再试（iOS 只允许点击后定位），' +
+        '并确认系统已允许「精确位置」；也可点击地图手动标点。',
+        true
+      );
+    }
+  };
 
   const onPos = (pos) => {
+    if (session !== geoSession) return;
     const { latitude, longitude, accuracy } = pos.coords;
     const acc = accuracy == null ? null : accuracy;
+    state.lastGeoError = null;
     if (!geoBest || (acc != null && (geoBest.acc == null || acc < geoBest.acc))) {
       geoBest = { lat: latitude, lon: longitude, acc };
     }
@@ -418,12 +506,21 @@ function locate() {
       geoFirstFix = true;
       refreshWeather(true); // 第一次拿到位置就取当地天气
     }
-    if (acc != null && acc <= 20) stopGeoWatch();
+    if (!geoDone) {
+      els.loc.textContent += ' · 采样中';
+      const s = stableFix(fixBuf, Date.now(), {
+        windowMs: 8000, maxAcc: 25, maxSpread: 20,
+      });
+      if (s && s.n >= 3 && gradeAccuracy(s.acc) === 'good') finish('early');
+    }
   };
 
   const onErr = (err) => {
+    if (session !== geoSession) return;
+    state.lastGeoError = err ? { code: err.code, message: err.message } : null;
+    if (geoBest) { finish('error', err); return; }
+    geoDone = true;
     stopGeoWatch();
-    if (geoBest) return; // 已经拿到位置就不打断
     els.loc.textContent = '未获取到定位';
     setWarn(describeGeoError(err), true);
   };
@@ -434,15 +531,18 @@ function locate() {
     maximumAge: 0, // 不使用缓存位置，避免拿到几分钟前的旧点
   });
 
-  geoTimer = setTimeout(() => {
-    stopGeoWatch();
-    if (geoBest) {
-      applyFix(geoBest.lat, geoBest.lon, geoBest.acc);
-    } else {
-      els.loc.textContent = '未获取到定位';
-      setWarn('定位超时，可点击地图手动设置位置。', true);
+  // iOS 只允许在用户点击后定位；页面加载自动调用可能被静默拦截
+  geoHintTimer = setTimeout(() => {
+    if (session === geoSession && !geoFirstFix && !geoDone) {
+      setWarn(
+        '还没有拿到位置：请点右上角「重新定位」。iOS 只允许点击后定位，' +
+        '并需在系统设置中为浏览器开启「精确位置」。',
+        true
+      );
     }
-  }, 8000);
+  }, 3000);
+
+  geoTimer = setTimeout(() => finish('timeout'), CONFIG.locateSampleMs);
 }
 
 function setLocation(lat, lon, acc, manual = false) {
@@ -450,14 +550,46 @@ function setLocation(lat, lon, acc, manual = false) {
   state.lon = lon;
   state.accuracy = acc == null ? null : acc;
   state.manualLocation = manual;
+  if (manual) {
+    stopGeoWatch(); // 手动标点后，旧的 GPS 回调不应再覆盖位置
+    clearFixBuffer(); // 手动点位不参与 GPS 稳健平均
+    if (state.survey) {
+      state.survey.lastAcc = null; // 手动点位没有 GPS 精度
+      updateSurveyUI();
+    }
+  }
   setCurrentMarker(lat, lon, state.accuracy);
   els.loc.textContent =
     `位置 ${lat.toFixed(5)}, ${lon.toFixed(5)}` +
-    (state.accuracy ? `（±${Math.round(state.accuracy)} m）` : '') +
-    (manual ? ' · 手动标点' : '');
-  els.loc.classList.remove('poor');
+    (state.accuracy ? `（${accuracyText(state.accuracy)}）` : '') +
+    (manual ? ' · 手动标点（不依赖 GPS）' : '');
+  els.loc.classList.remove('good', 'warn', 'poor');
+  if (!manual) {
+    const q = gradeAccuracy(state.accuracy);
+    if (q === 'good') els.loc.classList.add('good');
+    else if (q === 'ok') els.loc.classList.add('warn');
+    else if (q === 'poor') els.loc.classList.add('poor');
+  }
   updateSubmitState();
   refreshWeather(true);
+}
+
+/** 用多个 GPS 点求出的稳健位置更新界面（坐标已完成校准） */
+function useSmoothedPosition(lat, lon, acc, note) {
+  state.lat = lat;
+  state.lon = lon;
+  state.accuracy = acc == null ? null : acc;
+  setCurrentMarker(lat, lon, state.accuracy);
+  els.loc.textContent =
+    `位置 ${lat.toFixed(5)}, ${lon.toFixed(5)}` +
+    (state.accuracy != null ? `（${accuracyText(state.accuracy)}）` : '') +
+    (note ? ` · ${note}` : '');
+  els.loc.classList.remove('good', 'warn', 'poor');
+  const q = gradeAccuracy(state.accuracy);
+  if (q === 'good') els.loc.classList.add('good');
+  else if (q === 'ok') els.loc.classList.add('warn');
+  else if (q === 'poor') els.loc.classList.add('poor');
+  updateSubmitState();
 }
 
 /* ---------------- 天气（Open-Meteo 主源 + wttr.in 备源 + 手动兜底） ---------------- */
@@ -1012,6 +1144,39 @@ function addRecord() {
     return;
   }
 
+  // 用最近一段定位点求稳健位置，避免单个漂移点把记录画到几十米外
+  let lat = state.lat;
+  let lon = state.lon;
+  let acc = state.accuracy;
+  if (state.survey && !state.manualLocation) {
+    const s = stableFix(fixBuf, Date.now(), {
+      windowMs: CONFIG.surveyStableMs,
+      maxAcc: CONFIG.surveyMaxAcc,
+      maxSpread: 60,
+    });
+    if (!s) {
+      const msg = '巡测定位未就绪：最近 10 秒没有 ±60 m 内的稳定定位点。' +
+        '请到开阔处稍等几秒再提交；也可点地图手动标点后再记录。';
+      setWarn(msg, true);
+      showToast('定位不够稳，暂不记录：稍等几秒再提交', 'err', 5200);
+      return;
+    }
+    lat = s.lat;
+    lon = s.lon;
+    acc = s.acc;
+    useSmoothedPosition(lat, lon, acc, `稳健平均 ${s.n} 点`);
+  } else if (!state.manualLocation) {
+    const s = stableFix(fixBuf, Date.now(), {
+      windowMs: 8000, maxAcc: 200, maxSpread: 100,
+    });
+    if (s) {
+      lat = s.lat;
+      lon = s.lon;
+      acc = s.acc;
+      useSmoothedPosition(lat, lon, acc, '稳健平均');
+    }
+  }
+
   const bearing = w.wind_direction_10m; // 气象风向 = 风的来向 = 污染源方位
   const windSpeed = w.wind_speed_10m == null ? 0 : Number(w.wind_speed_10m);
   const st = windStabilityOf(w);
@@ -1019,15 +1184,15 @@ function addRecord() {
   const rec = {
     id: ++state.seq,
     time: new Date(),
-    lat: state.lat,
-    lon: state.lon,
+    lat,
+    lon,
     level,
     bearing,
     windSpeed,
     windSource: w.source || '',
     windR: st.R,
     sigmaAng: st.sigmaAng,
-    accuracy: state.accuracy == null ? null : Math.round(state.accuracy),
+    accuracy: acc == null ? null : Math.round(acc),
     surveyId: state.survey ? state.survey.id : null,
   };
   buildRecordLayers(rec);
@@ -1043,6 +1208,8 @@ function addRecord() {
     state.survey.lastPromptAt = Date.now();
     state.survey.dueNotified = false;
     updateSurveyGradient();
+    const n = state.records.filter((r) => r.surveyId === state.survey.id).length;
+    showToast(`已记录：等级 ${level} · 巡测第 ${n} 点`, 'ok', 2600);
   }
   updateSurveyUI();
   updateEvalUI();
@@ -1196,7 +1363,8 @@ function renderGradient(g, pts) {
   if (!g || g.brg == null) {
     if (pts.length >= 2) {
       els.surveyGrad.textContent =
-        '各观测点间距太小或气味等级相同，暂时判断不出气味增强方向。';
+        `各观测点间距不足 ${CONFIG.gradientMinDist} 米，或气味等级相同，` +
+        '暂时判断不出气味增强方向。';
       els.surveyGrad.classList.remove('hidden');
     } else {
       els.surveyGrad.classList.add('hidden');
@@ -1242,7 +1410,7 @@ function surveyRecords() {
 function updateSurveyGradient() {
   if (!state.survey && !state.lastSurvey) return;
   const pts = surveyRecords();
-  const g = smellGradient(pts);
+  const g = smellGradient(pts, { minDist: CONFIG.gradientMinDist });
   if (state.survey) state.survey.gradient = g;
   else if (state.lastSurvey) state.lastSurvey.gradient = g;
   renderGradient(g, pts);
@@ -1258,14 +1426,19 @@ function updateSurveyUI() {
   const n = state.records.filter((r) => r.surveyId === s.id).length;
   const since = Math.floor((Date.now() - s.lastPromptAt) / 1000);
   const due = n > 0 && Date.now() - s.lastPromptAt >= CONFIG.surveyPromptMs;
-  let txt = `巡测中 · 已 ${mins} 分钟 · 记录 ${n} 点`;
+  const acc = s.lastAcc == null ? null : Number(s.lastAcc);
+  const accTxt = acc != null ? ` · ±${Math.round(acc)} m` : '';
+  let txt = `巡测中 · 已 ${mins} 分钟 · 记录 ${n} 点${accTxt}`;
   if (!n) txt += ' · 走几步后按气味选择等级提交';
   else if (due) txt += ` · 距上次评分 ${since} 秒，建议再评一次`;
   els.surveyText.textContent = txt;
   els.surveyText.classList.toggle('due', due);
 
-  els.surveyBanner.classList.remove('hidden');
-  els.surveyBannerText.textContent = `巡测中 · ${mins} 分钟 · ${n} 点` +
+  els.surveyBanner.classList.remove('hidden', 'warn', 'bad');
+  const q = gradeAccuracy(acc);
+  if (q === 'ok') els.surveyBanner.classList.add('warn');
+  else if (q === 'poor') els.surveyBanner.classList.add('bad');
+  els.surveyBannerText.textContent = `巡测中 · ${mins} 分钟 · ${n} 点${accTxt}` +
     (due ? ' · 该评分了' : '');
 
   if (due && !s.dueNotified) {
@@ -1282,15 +1455,34 @@ function onSurveyPos(pos) {
   const { latitude, longitude, accuracy } = pos.coords;
   const acc = accuracy == null ? null : accuracy;
   applyFix(latitude, longitude, acc);
-  if (acc != null && acc > 60) return; // 精度太差点只更新位置，不进轨迹
-  if (state.lat == null || state.lon == null) return;
-  const last = s.trail[s.trail.length - 1];
-  const moved = last ? relPos(last[0], last[1], state.lat, state.lon).d : Infinity;
-  if (moved >= CONFIG.surveyTrailMinDist) {
-    s.trail.push([state.lat, state.lon]);
-    if (s.trail.length > 800) s.trail.shift();
-    drawTrail();
+  s.lastAcc = acc;
+  s.lastFixAt = Date.now();
+  if (acc != null && acc > CONFIG.surveyMaxAcc) {
+    // 精度太差：只更新当前位置，不进轨迹，也不用于提交时的稳健平均
+    if (!s.accWarned) {
+      s.accWarned = true;
+      setWarn(
+        `巡测定位精度较低（±${Math.round(acc)} m），轨迹可能不准。请到开阔处并确认已开启「精确位置」。`,
+        true
+      );
+    }
+    return;
   }
+  if (state.lat == null || state.lon == null) return;
+  const now = Date.now();
+  const last = s.trail[s.trail.length - 1];
+  if (last) {
+    const prev = { lat: last[0], lon: last[1], t: last[2] || now };
+    const next = { lat: state.lat, lon: state.lon, t: now };
+    if (!plausible(prev, next, { maxSpeed: 3.5, tolerance: 25 })) {
+      return; // 瞬移/漂移点，不画进轨迹（位置显示仍已更新）
+    }
+    const moved = relPos(last[0], last[1], state.lat, state.lon).d;
+    if (moved < CONFIG.surveyTrailMinDist) return;
+  }
+  s.trail.push([state.lat, state.lon, now]);
+  if (s.trail.length > 800) s.trail.shift();
+  drawTrail();
 }
 
 function onSurveyErr(err) {
@@ -1312,11 +1504,15 @@ function startSurvey() {
     showToast('巡测需要 HTTPS 定位，请改用 HTTPS 打开', 'err');
     return;
   }
+  // 巡测接管持续定位，避免首轮定位采样与巡测 watch 互相覆盖
+  stopGeoWatch();
   const id = Date.now();
   state.survey = {
     id, startedAt: id, lastPromptAt: id,
     trail: [], watchId: null, gradient: null,
-    dueNotified: false, errWarned: false,
+    dueNotified: false, errWarned: false, accWarned: false,
+    lastAcc: state.manualLocation ? null : state.accuracy,
+    lastFixAt: state.manualLocation ? null : (state.lastFixAt || null),
   };
   state.lastSurvey = null;
   removeTrail();
@@ -1348,7 +1544,7 @@ function stopSurvey() {
     state.surveyTimer = null;
   }
   const pts = state.records.filter((r) => r.surveyId === s.id);
-  const g = smellGradient(pts);
+  const g = smellGradient(pts, { minDist: CONFIG.gradientMinDist });
   const ref = pts.length ? pts[pts.length - 1] : null;
   state.lastSurvey = {
     id: s.id,

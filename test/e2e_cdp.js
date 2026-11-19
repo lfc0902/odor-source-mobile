@@ -159,6 +159,8 @@ async function shot(cdp, filename) {
       report.geoError = e.message;
     }
     report.geoOk = geoOk;
+    // 结束首轮定位采样，避免 20 秒后的收尾覆盖后续用例注入的位置
+    await evalJs(cdp, 'stopGeoWatch(); true');
     if (!geoOk) {
       // 环境不支持定位模拟时退回直接注入，保证其余用例可跑
       await evalJs(cdp, 'setLocation(39.9042, 116.4074, 15); true');
@@ -278,6 +280,38 @@ async function shot(cdp, filename) {
     // 巡测：走动记录 3 个点（气味逐渐增强）→ 增强方向箭头 + 轨迹
     const surveyWeather = `{source:'手动输入', wind_speed_10m:2, wind_direction_10m:0,
       desc:'', temperature_2m:null, relative_humidity_2m:null, history:null}`;
+    // 定位质量门控：巡测中若最近没有 ≤60 m 的 GPS 点，不应写入记录
+    report.surveyGate = JSON.parse(await evalJs(cdp, `(() => {
+      clearAll();
+      startSurvey();
+      state.weather = ${surveyWeather};
+      state.manualLocation = false;
+      clearFixBuffer();
+      state.lat = 39.9042; state.lon = 116.4074;
+      selectLevel(3);
+      const before = state.records.length;
+      addRecord();
+      const res = {
+        before, after: state.records.length,
+        blocked: state.records.length === before,
+        toast: document.getElementById('toast').innerText,
+        warn: document.getElementById('warnText').innerText,
+      };
+      // 有稳定 GPS 点时应通过，并用精度加权位置记录（50 m 漂移点应被压低权重）
+      pushFix(39.90400, 116.40740, 50);
+      pushFix(39.90420, 116.40740, 10);
+      pushFix(39.90420, 116.40740, 10);
+      selectLevel(3);
+      addRecord();
+      const rec = state.records[state.records.length - 1];
+      res.smoothLat = rec ? rec.lat : null;
+      res.smoothAcc = rec ? rec.accuracy : null;
+      res.recorded = state.records.length - before;
+      stopSurvey();
+      clearAll();
+      return JSON.stringify(res);
+    })()`));
+
     const surveyActive = JSON.parse(await evalJs(cdp, `(() => {
       clearAll();
       startSurvey();
@@ -541,7 +575,7 @@ async function shot(cdp, filename) {
       await cdp.send('Page.bringToFront');
       await cdp.send('Browser.grantPermissions', {
         origin: new URL(BASE).origin,
-        permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'],
+        permissions: ['geolocation', 'clipboardReadWrite', 'clipboardSanitizedWrite'],
       });
     } catch (_) { /* 权限 API 不可用则走 execCommand 兜底 */ }
     await trustedClick(cdp, '#btnExportCopy');
@@ -607,14 +641,26 @@ async function shot(cdp, filename) {
     })()`));
 
     // 低精度定位：应明确提示「精度较低」并引导手动校正
+    // （前面的剪贴板授权会重置 origin 权限，这里重新授予定位权限）
+    try {
+      await cdp.send('Browser.grantPermissions', {
+        origin: new URL(BASE).origin,
+        permissions: ['geolocation'],
+      });
+    } catch (_) { /* 旧 Edge 忽略 */ }
     await cdp.send('Emulation.setGeolocationOverride', {
       latitude: 39.9042, longitude: 116.4074, accuracy: 500,
     });
     await evalJs(cdp, 'locate(); true');
-    await sleep(1200);
-    report.poorAccuracy = JSON.parse(await evalJs(cdp,
-      'JSON.stringify({text:document.getElementById("locText").innerText,' +
-      'poor:document.getElementById("locText").classList.contains("poor")})'));
+    await sleep(2500);
+    report.poorAccuracy = JSON.parse(await evalJs(cdp, `JSON.stringify({
+      text: document.getElementById('locText').innerText,
+      poor: document.getElementById('locText').classList.contains('poor'),
+      acc: state.accuracy, err: state.lastGeoError, dbg: state.geoDebug,
+      fix: fixBuf.length, gs: geoSession,
+      warn: document.getElementById('warnText').innerText,
+      warnHidden: document.getElementById('warnText').classList.contains('hidden'),
+    })`));
     await evalJs(cdp, 'stopGeoWatch(); true');
 
     // 位置校准：点地图真实位置 → 保存本机偏移 → 新 GPS 自动套用 → 可清除

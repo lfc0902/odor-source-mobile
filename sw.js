@@ -1,7 +1,7 @@
 /* 离线壳：缓存页面与静态资源；天气和地图瓦片仍走网络 */
 'use strict';
 
-const CACHE = 'odor-mvp-v9';
+const CACHE = 'odor-mvp-v10';
 const ASSETS = [
   './',
   'index.html',
@@ -9,6 +9,7 @@ const ASSETS = [
   'js/geo.js',
   'js/coords.js',
   'js/fusion.js',
+  'js/geofix.js',
   'js/survey.js',
   'js/exporters.js',
   'js/app.js',
