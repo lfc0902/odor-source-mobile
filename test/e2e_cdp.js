@@ -213,6 +213,51 @@ async function shot(cdp, filename) {
     await evalJs(cdp, 'clearAll(); true');
     report.recordsAfterManualClear = await evalJs(cdp, 'state.records.length');
 
+    // 多条记录综合估计：两条互相垂直的风向 → 热区 + 概率区域 + 可信度
+    report.fusion = JSON.parse(await evalJs(cdp, `(() => {
+      clearAll();
+      const w1 = { source: '手动输入', wind_speed_10m: 2, wind_direction_10m: 0,
+        desc: '', temperature_2m: null, relative_humidity_2m: null };
+      const w2 = Object.assign({}, w1, { wind_direction_10m: 90 });
+      state.weather = w1;
+      state.lat = 39.9042; state.lon = 116.4074; state.manualLocation = true;
+      selectLevel(4); addRecord();
+      state.weather = w2;
+      state.lat = 39.9080; state.lon = 116.4074; state.manualLocation = true;
+      selectLevel(4); addRecord();
+      const f = state.fusion;
+      return JSON.stringify({
+        records: state.records.length,
+        visible: !document.getElementById('fusion').classList.contains('hidden'),
+        text: document.getElementById('fusionText').innerText,
+        conf: document.getElementById('fusionConf').innerText,
+        hasHeat: !!state.heatmap && map.hasLayer(state.heatmap),
+        hasPeakMarker: !!state.peakMarker && map.hasLayer(state.peakMarker),
+        peak: f && f.peak,
+        area50: f && f.region50.area,
+        area80: f && f.region80.area,
+        notes: f && f.notes,
+      });
+    })()`));
+    await sleep(1200);
+    await shot(cdp, '_e2e_fusion.png');
+    await evalJs(cdp, 'focusFusion(); true');
+    await sleep(800);
+    report.fusionFocusZoom = await evalJs(cdp, 'map.getZoom()');
+    report.heatToggle = JSON.parse(await evalJs(cdp, `(() => {
+      toggleHeat();
+      const off = { hasHeat: !!state.heatmap,
+        btn: document.getElementById('btnFusionToggle').innerText };
+      toggleHeat();
+      const on = { hasHeat: !!state.heatmap && map.hasLayer(state.heatmap) };
+      return JSON.stringify({ off, on });
+    })()`));
+    await evalJs(cdp, 'clearAll(); true');
+    report.fusionAfterClear = JSON.parse(await evalJs(cdp,
+      'JSON.stringify({records:state.records.length,' +
+      'hidden:document.getElementById("fusion").classList.contains("hidden"),' +
+      'hasHeat:!!state.heatmap})'));
+
     // 备源链路模拟：让 Open-Meteo 失败，应自动落到 wttr.in
     report.fallback = JSON.parse(await evalJs(cdp, `(async () => {
       const orig = window.fetch.bind(window);

@@ -51,18 +51,33 @@
 
   <div id="summary" class="summary"></div>
 
+  <div id="fusion" class="fusion hidden">
+    <div class="fusion-head">
+      <span>综合估计 <span id="fusionConf" class="conf"></span></span>
+      <span class="btns">
+        <button id="btnFusionToggle" class="ghost small">隐藏热区</button>
+        <button id="btnFusionFocus" class="ghost small">聚焦</button>
+      </span>
+    </div>
+    <div id="fusionText" class="fusion-text"></div>
+    <div class="fusion-note">
+      概率为模型相对评分，不是实测置信度；风向变化、多源或室内时仅供参考。
+    </div>
+  </div>
+
   <div class="block-title">已提交记录 <span id="recCount" class="muted"></span></div>
   <div id="records" class="records"><div class="empty">还没有记录。定位后选择气味强度并提交。</div></div>
 
   <div class="foot">
     <button id="btnClear" class="ghost small">清除全部</button>
-    <span class="hint">扇形 = 气味来源的可能区域（上风向）</span>
+    <span class="hint">扇形 = 可能的来源方向（粗略，上风向）</span>
   </div>
 </section>
 
 <script src="vendor/leaflet/leaflet.js"></script>
 <script src="js/geo.js"></script>
 <script src="js/coords.js"></script>
+<script src="js/fusion.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

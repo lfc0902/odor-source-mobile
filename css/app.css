@@ -225,6 +225,37 @@ html, body {
 .sum-card b { color: var(--accent); }
 .sum-card .sub { color: var(--muted); font-size: 12px; }
 
+/* ---------- 多条记录综合估计 ---------- */
+.fusion {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: var(--panel);
+}
+.fusion-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.conf {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-left: 4px;
+  vertical-align: 1px;
+}
+.conf.high { color: #052e16; background: var(--ok); }
+.conf.medium { color: #422006; background: #eab308; }
+.conf.low { color: #450a0a; background: var(--danger); }
+.fusion-text { margin-top: 6px; font-size: 12px; line-height: 1.6; color: var(--text); }
+.fusion-note { margin-top: 6px; font-size: 11px; line-height: 1.5; color: var(--muted); }
+
 /* ---------- 记录列表 ---------- */
 .records { display: flex; flex-direction: column; gap: 6px; }
 .rec {

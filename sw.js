@@ -1,13 +1,14 @@
 /* 离线壳：缓存页面与静态资源；天气和地图瓦片仍走网络 */
 'use strict';
 
-const CACHE = 'odor-mvp-v6';
+const CACHE = 'odor-mvp-v7';
 const ASSETS = [
   './',
   'index.html',
   'css/app.css',
   'js/geo.js',
   'js/coords.js',
+  'js/fusion.js',
   'js/app.js',
   'vendor/leaflet/leaflet.js',
   'vendor/leaflet/leaflet.css',

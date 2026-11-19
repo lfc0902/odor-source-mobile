@@ -34,6 +34,10 @@ const state = {
   calib: null,        // 本机定位系统偏移（设备坐标系不是 WGS-84 时用）
   lastRawFix: null,   // 最近一次原始 GPS（未经校准）
   calibrating: false,
+  fusion: null,       // 多条记录的综合估计
+  heatmap: null,      // 概率热区图层
+  peakMarker: null,   // 模型最可能点标记
+  showHeat: true,
 };
 
 const CALIB_KEY = 'odor_calib_v1';
@@ -70,6 +74,11 @@ const els = {
   mwApply: $('mwApply'),
   calib: $('btnCalib'),
   envHint: $('envHint'),
+  fusion: $('fusion'),
+  fusionConf: $('fusionConf'),
+  fusionText: $('fusionText'),
+  fusionToggle: $('btnFusionToggle'),
+  fusionFocus: $('btnFusionFocus'),
 };
 
 /* ---------------- 地图 ---------------- */
@@ -93,6 +102,9 @@ L.tileLayer(
 ).addTo(map);
 
 L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+map.createPane('heatPane');
+map.getPane('heatPane').style.zIndex = 350;
 
 let currentMarker = null;
 let accuracyCircle = null;
@@ -513,6 +525,193 @@ function applyManualWind() {
   els.manual.classList.add('hidden');
 }
 
+/* ---------------- 多条记录综合估计（js/fusion.js） ---------------- */
+
+const { rel: relPos } = FUSION;
+
+function fusionInputs() {
+  return state.records.map((r) => {
+    const cfg = CONFIG.levels[r.level];
+    return {
+      lat: r.lat,
+      lon: r.lon,
+      bearing: r.bearing,
+      near: cfg.near,
+      far: cfg.far,
+      windSpeed: r.windSpeed,
+      level: r.level,
+    };
+  });
+}
+
+function rampColor(t) {
+  const stops = [
+    [0.0, [56, 189, 248]],
+    [0.4, [34, 197, 94]],
+    [0.7, [234, 179, 8]],
+    [1.0, [239, 68, 68]],
+  ];
+  let a = stops[0];
+  let b = stops[stops.length - 1];
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) { a = stops[i - 1]; b = stops[i]; break; }
+  }
+  const span = b[0] - a[0] || 1;
+  const k = Math.max(0, Math.min(1, (t - a[0]) / span));
+  return [
+    Math.round(a[1][0] + (b[1][0] - a[1][0]) * k),
+    Math.round(a[1][1] + (b[1][1] - a[1][1]) * k),
+    Math.round(a[1][2] + (b[1][2] - a[1][2]) * k),
+  ];
+}
+
+function removeHeatmap() {
+  if (state.heatmap) {
+    map.removeLayer(state.heatmap);
+    state.heatmap = null;
+  }
+  state.records.forEach((r) => r.sector.setStyle({ fillOpacity: 0.18 }));
+}
+
+function removePeakMarker() {
+  if (state.peakMarker) {
+    map.removeLayer(state.peakMarker);
+    state.peakMarker = null;
+  }
+}
+
+function renderPeakMarker() {
+  removePeakMarker();
+  const f = state.fusion;
+  if (!f || f.error) return;
+  state.peakMarker = L.circleMarker(toDisp(f.peak.lat, f.peak.lon), {
+    radius: 5,
+    color: '#ffffff',
+    weight: 2,
+    fillColor: '#ef4444',
+    fillOpacity: 1,
+    interactive: false,
+  }).addTo(map);
+  state.peakMarker.bindTooltip('模型最可能点（粗略）', { direction: 'top' });
+}
+
+/** 把归一化概率画成一张贴在地图上的热区图（单个 imageOverlay，手机上也不卡） */
+function renderHeatmap() {
+  const f = state.fusion;
+  if (!f || f.error) return;
+  removeHeatmap();
+  const canvas = document.createElement('canvas');
+  canvas.width = f.nLon;
+  canvas.height = f.nLat;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(f.nLon, f.nLat);
+  const data = img.data;
+  const peakP = f.peak.p || 1;
+  for (let i = 0; i < f.nLat; i++) {
+    for (let j = 0; j < f.nLon; j++) {
+      const p = f.weights[i * f.nLon + j];
+      const t = p / peakP;
+      if (t < 0.05) continue;
+      const rgb = rampColor(Math.min(1, Math.pow(t, 0.6)));
+      const o = ((f.nLat - 1 - i) * f.nLon + j) * 4; // 图像顶部对应北
+      data[o] = rgb[0];
+      data[o + 1] = rgb[1];
+      data[o + 2] = rgb[2];
+      data[o + 3] = Math.round(255 * Math.min(0.82, 0.12 + 0.8 * Math.sqrt(t)));
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const sw = toDisp(f.minLat, f.minLon);
+  const ne = toDisp(f.maxLat, f.maxLon);
+  state.heatmap = L.imageOverlay(canvas.toDataURL('image/png'),
+    L.latLngBounds(sw, ne), {
+      pane: 'heatPane',
+      opacity: 0.85,
+      interactive: false,
+    }).addTo(map);
+  state.records.forEach((r) => r.sector.setStyle({ fillOpacity: 0.06 }));
+}
+
+function fmtArea(m2) {
+  if (!(m2 >= 0)) return '—';
+  if (m2 >= 1e6) return (m2 / 1e6).toFixed(1) + ' km²';
+  if (m2 >= 1e4) return (m2 / 1e4).toFixed(1) + ' 公顷';
+  return Math.round(m2) + ' m²';
+}
+
+function renderFusion() {
+  const f = state.fusion;
+  if (!f || state.records.length < 2) {
+    els.fusion.classList.add('hidden');
+    return;
+  }
+  els.fusion.classList.remove('hidden');
+  if (f.error) {
+    els.fusionConf.textContent = '';
+    els.fusionConf.className = 'conf';
+    els.fusionText.textContent = '无法综合：' + f.error + '。请检查记录的风向是否正确。';
+    return;
+  }
+  const confText = { high: '较高', medium: '中等', low: '较低' }[f.confidence] || '';
+  els.fusionConf.textContent = confText;
+  els.fusionConf.className = 'conf ' + f.confidence;
+
+  const fromCur = state.lat != null ? relPos(state.lat, state.lon, f.peak.lat, f.peak.lon) : null;
+  let txt = `已综合 ${f.count} 条记录。模型最可能点见地图红点`;
+  if (fromCur) {
+    txt += `，距当前位置约 ${Math.round(fromCur.d)} 米（${dirName(fromCur.brg)}方向）`;
+  }
+  txt += `。50% 概率区域约 ${fmtArea(f.region50.area)}，` +
+         `80% 概率区域约 ${fmtArea(f.region80.area)}。` +
+         '热区颜色越红，模型概率越高。';
+  if (f.notes.length) txt += ' ' + f.notes.join('；') + '。';
+  els.fusionText.textContent = txt;
+  els.fusionToggle.textContent = state.showHeat ? '隐藏热区' : '显示热区';
+}
+
+function updateFusion() {
+  if (state.records.length < 2) {
+    state.fusion = null;
+    removeHeatmap();
+    removePeakMarker();
+    renderFusion();
+    return;
+  }
+  const f = FUSION.compute(fusionInputs(), {
+    cells: 128,
+    sigmaAng: CONFIG.halfAngleDeg,
+    halfAngle: CONFIG.halfAngleDeg,
+  });
+  state.fusion = f;
+  if (f && !f.error && state.showHeat) renderHeatmap();
+  else removeHeatmap();
+  renderPeakMarker();
+  renderFusion();
+}
+
+function toggleHeat() {
+  state.showHeat = !state.showHeat;
+  if (state.showHeat && state.fusion && !state.fusion.error) renderHeatmap();
+  else removeHeatmap();
+  renderFusion();
+}
+
+function focusFusion() {
+  const f = state.fusion;
+  if (!f || f.error || !f.region80.bounds) return;
+  const b = f.region80.bounds;
+  const sheetH = document.getElementById('sheet').offsetHeight || 0;
+  map.fitBounds(L.latLngBounds(
+    toDisp(b.minLat, b.minLon),
+    toDisp(b.maxLat, b.maxLon)
+  ), {
+    paddingTopLeft: [40, 90],
+    paddingBottomRight: [40, sheetH + 30],
+    maxZoom: 16,
+  });
+}
+
 /* ---------------- 提交与绘制 ---------------- */
 
 function addRecord() {
@@ -571,7 +770,7 @@ function addRecord() {
     fillOpacity: 0.06,
     interactive: false,
   }).addTo(map);
-  estCircle.bindTooltip('估算源位置范围', { direction: 'top' });
+  estCircle.bindTooltip('粗略估算位置范围', { direction: 'top' });
 
   const rec = {
     id: ++state.seq,
@@ -590,6 +789,7 @@ function addRecord() {
   renderRecords();
   renderSummary(bearing, windSpeed, cfg);
   fitToLayer(sector);
+  updateFusion();
 }
 
 /** 让要素落在底部面板上方的可视区域，而不是被面板遮住 */
@@ -608,10 +808,10 @@ function renderSummary(bearing, windSpeed, cfg) {
     cfg.near === 0 ? `约 0–${cfg.far} 米` : `约 ${cfg.near}–${cfg.far} 米`;
   els.summary.innerHTML = `
     <div class="sum-card">
-      污染源大概率在当前位置的 <b>${dirName(bearing)}方向</b>，距离 <b>${range}</b>。
+      污染源可能在当前位置的 <b>${dirName(bearing)}方向</b>，距离 <b>${range}</b>（粗略估计）。
       <div class="sub">
         依据：${dirName(bearing)}风 ${Math.round(bearing)}°、${windSpeed.toFixed(1)} m/s；
-        气味等级 ${level}（${cfg.label}）。扇形中线距离按 ${(cfg.near + cfg.far) / 2} 米估算。
+        气味等级 ${level}（${cfg.label}）。距离区间为经验值，虚线圆只表示区间中点。
       </div>
     </div>`;
 }
@@ -645,10 +845,14 @@ function renderRecords() {
 function focusRecord(r) {
   fitToLayer(r.sector);
   r.sector.setStyle({ weight: 3, fillOpacity: 0.3 });
-  setTimeout(() => r.sector.setStyle({ weight: 1.5, fillOpacity: 0.18 }), 1200);
+  setTimeout(() => r.sector.setStyle({
+    weight: 1.5,
+    fillOpacity: state.heatmap ? 0.06 : 0.18,
+  }), 1200);
 }
 
 function clearAll() {
+  removeHeatmap();
   state.records.forEach((r) => {
     map.removeLayer(r.sector);
     map.removeLayer(r.dot);
@@ -657,6 +861,7 @@ function clearAll() {
   state.records = [];
   els.summary.innerHTML = '';
   renderRecords();
+  updateFusion();
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -668,6 +873,8 @@ els.clear.addEventListener('click', clearAll);
 els.manualBtn.addEventListener('click', () => els.manual.classList.toggle('hidden'));
 els.mwApply.addEventListener('click', applyManualWind);
 els.calib.addEventListener('click', toggleCalibration);
+els.fusionToggle.addEventListener('click', toggleHeat);
+els.fusionFocus.addEventListener('click', focusFusion);
 
 map.on('click', (e) => {
   const [lat, lon] = gcj02ToWgs84(e.latlng.lat, e.latlng.lng);
@@ -684,6 +891,7 @@ renderLevelButtons();
 renderRecords();
 updateSubmitState();
 updateCalibButton();
+renderFusion();
 
 if (/MicroMessenger/i.test(navigator.userAgent)) {
   els.envHint.textContent =
