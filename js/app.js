@@ -11,6 +11,9 @@ const CONFIG = {
   defaultZoom: 13,
   halfAngleDeg: 25,          // 扇形半角（度）
   weatherMaxAgeMs: 10 * 60 * 1000,
+  windHistoryHours: 6,       // 取近几小时逐时风评估稳定性
+  surveyPromptMs: 45 * 1000, // 巡测时每隔多久提示再评一次
+  surveyTrailMinDist: 10,    // 巡测轨迹最小间距（米），过滤 GPS 抖动
   // 气味等级 → 距污染源的大致距离区间（米）。经验值，均可调。
   levels: {
     1: { label: '勉强闻到', short: '勉强', near: 1500, far: 6000, color: '#38bdf8' },
@@ -38,9 +41,22 @@ const state = {
   heatmap: null,      // 概率热区图层
   peakMarker: null,   // 模型最可能点标记
   showHeat: true,
+  survey: null,       // 巡测会话 {id, startedAt, lastPromptAt, trail, watchId, gradient, dueNotified}
+  surveyTimer: null,
+  trailLayer: null,   // 巡测轨迹线
+  gradientLayer: null,// 气味增强方向箭头（线）
+  gradientMarker: null,
+  lastSurvey: null,   // 结束后的摘要 {id, gradient, lat, lon, points}
+  evalPick: false,    // 正在地图上点选真值
+  evalTruth: null,    // 对照实验的真实源位置
+  evalMarker: null,
+  evalLine: null,
+  evals: [],          // 已保存的评估结果
 };
 
 const CALIB_KEY = 'odor_calib_v1';
+const SESSION_KEY = 'odor_session_v1';
+const EVALS_KEY = 'odor_evals_v1';
 
 function loadCalib() {
   try {
@@ -53,6 +69,20 @@ function loadCalib() {
   return null;
 }
 state.calib = loadCalib();
+
+function loadEvals() {
+  try {
+    const v = JSON.parse(localStorage.getItem(EVALS_KEY) || '[]');
+    if (Array.isArray(v)) {
+      return v.filter((e) => e && e.truth && e.peak &&
+        Number.isFinite(e.truth.lat) && Number.isFinite(e.truth.lon));
+    }
+  } catch (_) { /* 隐私模式等 */ }
+  return [];
+}
+state.evals = loadEvals();
+
+const { gradient: smellGradient, windStability, sigFromStability } = SURVEY;
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -79,6 +109,20 @@ const els = {
   fusionText: $('fusionText'),
   fusionToggle: $('btnFusionToggle'),
   fusionFocus: $('btnFusionFocus'),
+  windHint: $('windHint'),
+  survey: $('survey'),
+  surveyBtn: $('btnSurvey'),
+  surveyText: $('surveyText'),
+  surveyGrad: $('surveyGrad'),
+  exportCsv: $('btnExportCsv'),
+  exportGeo: $('btnExportGeo'),
+  evalToggle: $('btnEvalToggle'),
+  evalPanel: $('evalPanel'),
+  evalPick: $('btnEvalPick'),
+  evalRun: $('btnEvalRun'),
+  evalClear: $('btnEvalClear'),
+  evalExport: $('btnEvalExport'),
+  evalText: $('evalText'),
 };
 
 /* ---------------- 地图 ---------------- */
@@ -445,6 +489,34 @@ async function fetchWttr(lat, lon) {
   };
 }
 
+/** 近几小时逐时风：只用于评估风向稳定性，失败不影响主天气链路 */
+async function fetchWindHistory(lat, lon) {
+  const url =
+    'https://api.open-meteo.com/v1/forecast' +
+    `?latitude=${lat.toFixed(4)}&longitude=${lon.toFixed(4)}` +
+    '&hourly=wind_speed_10m,wind_direction_10m' +
+    '&wind_speed_unit=ms&timezone=auto&past_days=1&forecast_days=1';
+  const data = await fetchJson(url, 6000);
+  const h = data.hourly;
+  if (!h || !Array.isArray(h.time) || !Array.isArray(h.wind_direction_10m) ||
+      !Array.isArray(h.wind_speed_10m)) {
+    throw new Error('历史风场响应异常');
+  }
+  const now = Date.now();
+  const keep = [];
+  for (let i = 0; i < h.time.length; i++) {
+    const t = Date.parse(h.time[i]);
+    if (Number.isFinite(t) && t <= now + 15 * 60 * 1000) keep.push(i);
+  }
+  const last = keep.slice(-CONFIG.windHistoryHours);
+  const st = windStability({
+    wind_direction_10m: last.map((i) => h.wind_direction_10m[i]),
+    wind_speed_10m: last.map((i) => h.wind_speed_10m[i]),
+  });
+  if (!st.count) throw new Error('无历史风数据');
+  return st;
+}
+
 /** 依次尝试数据源，任一成功即返回 */
 async function fetchWeather(lat, lon) {
   const errors = [];
@@ -463,7 +535,11 @@ async function refreshWeather(force = false) {
   if (!force && Date.now() - state.weatherAt < CONFIG.weatherMaxAgeMs) return;
   els.weather.textContent = '正在获取当地气象…';
   try {
-    const cur = await fetchWeather(state.lat, state.lon);
+    const [cur, hist] = await Promise.all([
+      fetchWeather(state.lat, state.lon),
+      fetchWindHistory(state.lat, state.lon).catch(() => null),
+    ]);
+    cur.history = hist;
     state.weather = cur;
     state.weatherAt = Date.now();
     renderWeather(cur);
@@ -471,8 +547,30 @@ async function refreshWeather(force = false) {
     state.weather = null;
     state.weatherAt = 0;
     els.weather.textContent = '气象获取失败';
+    els.windHint.classList.add('hidden');
     els.manual.classList.remove('hidden');
     setWarn(`天气接口失败（${e.message}）。可点「手动」输入风向风速。`, true);
+  }
+}
+
+function renderWindHint(cur) {
+  const h = cur && cur.history;
+  if (!h || h.count < 3) {
+    els.windHint.classList.add('hidden');
+    return;
+  }
+  const r = h.R.toFixed(2);
+  if (h.R >= 0.75) {
+    els.windHint.textContent = `近 ${h.count} 小时风向较稳定（一致性 ${r}）`;
+    els.windHint.className = 'wind-hint ok';
+  } else if (h.R >= 0.45) {
+    els.windHint.textContent =
+      `近 ${h.count} 小时风向有摆动（一致性 ${r}），方位估计已适当放宽`;
+    els.windHint.className = 'wind-hint warnish';
+  } else {
+    els.windHint.textContent =
+      `近 ${h.count} 小时风向变化较大（一致性 ${r}），方位可信度较低`;
+    els.windHint.className = 'wind-hint bad';
   }
 }
 
@@ -491,6 +589,7 @@ function renderWeather(cur) {
   if (cur.relative_humidity_2m != null) parts.push(`湿度 ${Math.round(cur.relative_humidity_2m)}%`);
   const src = cur.source ? ` <span class="src">（${cur.source}）</span>` : '';
   els.weather.innerHTML = parts.join(' · ') + src;
+  renderWindHint(cur);
 
   if (ws != null && ws < 0.5) {
     setWarn('当前风速过小（<0.5 m/s），风向参考性差，溯源结果可靠性下降。', true);
@@ -517,6 +616,7 @@ function applyManualWind() {
     wind_speed_10m: spd,
     wind_direction_10m: dir,
     desc: '',
+    history: null, // 手动风没有历史风场，方位不确定度按默认值
   };
   state.weather = w;
   state.weatherAt = Date.now();
@@ -540,6 +640,8 @@ function fusionInputs() {
       far: cfg.far,
       windSpeed: r.windSpeed,
       level: r.level,
+      sigmaAng: r.sigmaAng,
+      windR: r.windR,
     };
   });
 }
@@ -671,11 +773,13 @@ function renderFusion() {
 }
 
 function updateFusion() {
+  removeEvalLine(); // 记录变化后旧的真值-峰值连线失效
   if (state.records.length < 2) {
     state.fusion = null;
     removeHeatmap();
     removePeakMarker();
     renderFusion();
+    updateEvalUI();
     return;
   }
   const f = FUSION.compute(fusionInputs(), {
@@ -688,6 +792,7 @@ function updateFusion() {
   else removeHeatmap();
   renderPeakMarker();
   renderFusion();
+  updateEvalUI();
 }
 
 function toggleHeat() {
@@ -714,9 +819,121 @@ function focusFusion() {
 
 /* ---------------- 提交与绘制 ---------------- */
 
+/** 依据记录的数值生成地图图层（也用于从本地会话恢复） */
+function buildRecordLayers(rec) {
+  const cfg = CONFIG.levels[rec.level];
+  // 几何在 WGS-84 中计算，绘制前统一转 GCJ-02
+  const poly = sectorPolygon(
+    rec.lat, rec.lon, rec.bearing, CONFIG.halfAngleDeg, cfg.near, cfg.far
+  ).map(([la, lo]) => toDisp(la, lo));
+  rec.sector = L.polygon(poly, {
+    color: cfg.color,
+    weight: 1.5,
+    opacity: 0.9,
+    fillColor: cfg.color,
+    fillOpacity: 0.18,
+    interactive: false,
+  }).addTo(map);
+
+  rec.dot = L.circleMarker(toDisp(rec.lat, rec.lon), {
+    radius: 4,
+    color: '#0b1220',
+    weight: 1,
+    fillColor: cfg.color,
+    fillOpacity: 1,
+    interactive: false,
+  }).addTo(map);
+
+  // 估算的"大概位置"：扇形中线，取距离区间中点
+  const midR = (cfg.near + cfg.far) / 2;
+  const estPos = destination(rec.lat, rec.lon, rec.bearing, midR);
+  rec.estCircle = L.circle(toDisp(estPos[0], estPos[1]), {
+    radius: Math.max((cfg.far - cfg.near) / 2, 20),
+    color: cfg.color,
+    weight: 1.5,
+    dashArray: '6 6',
+    opacity: 0.85,
+    fillColor: cfg.color,
+    fillOpacity: 0.06,
+    interactive: false,
+  }).addTo(map);
+  rec.estCircle.bindTooltip('粗略估算位置范围', { direction: 'top' });
+}
+
+function recordData(r) {
+  return {
+    id: r.id,
+    time: r.time instanceof Date ? r.time.toISOString() : r.time,
+    lat: r.lat,
+    lon: r.lon,
+    level: r.level,
+    bearing: r.bearing,
+    windSpeed: r.windSpeed,
+    windSource: r.windSource || '',
+    windR: r.windR == null ? null : r.windR,
+    sigmaAng: r.sigmaAng == null ? null : r.sigmaAng,
+    accuracy: r.accuracy == null ? null : r.accuracy,
+    surveyId: r.surveyId == null ? null : r.surveyId,
+  };
+}
+
+/** 每次记录变化后写入本机会话，刷新/重开页面可恢复 */
+function saveSession() {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      v: 1,
+      savedAt: new Date().toISOString(),
+      seq: state.seq,
+      records: state.records.map(recordData),
+    }));
+  } catch (_) { /* 隐私模式/容量不足 */ }
+}
+
+function restoreSession() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch (_) { return; }
+  if (!saved || saved.v !== 1 || !Array.isArray(saved.records)) return;
+  const recs = saved.records
+    .filter((r) => r && Number.isFinite(Number(r.lat)) && Number.isFinite(Number(r.lon)) &&
+      Number.isFinite(Number(r.bearing)) && CONFIG.levels[Number(r.level)])
+    .map((r) => ({
+      id: Number(r.id) || 0,
+      time: new Date(r.time),
+      lat: Number(r.lat),
+      lon: Number(r.lon),
+      level: Number(r.level),
+      bearing: Number(r.bearing),
+      windSpeed: Number(r.windSpeed) || 0,
+      windSource: r.windSource || '',
+      windR: r.windR == null ? null : Number(r.windR),
+      sigmaAng: r.sigmaAng == null ? null : Number(r.sigmaAng),
+      accuracy: r.accuracy == null ? null : Number(r.accuracy),
+      surveyId: r.surveyId == null ? null : Number(r.surveyId),
+    }))
+    .filter((r) => Number.isFinite(r.time.getTime()));
+  recs.forEach(buildRecordLayers);
+  state.records = recs;
+  state.seq = Math.max(saved.seq || 0, ...recs.map((r) => r.id || 0));
+  if (!recs.length) return;
+  renderRecords();
+  renderSummary(recs[recs.length - 1]);
+  updateFusion();
+  setTimeout(() => {
+    fitToLayer(L.featureGroup(recs.map((r) => r.sector)));
+  }, 300);
+}
+
+/** 每次观测期间的风场稳定性 → 方位标准差（无历史风场则用默认） */
+function windStabilityOf(w) {
+  const h = w && w.history;
+  if (!h || h.count < 3 || !Number.isFinite(h.R)) {
+    return { R: null, sigmaAng: CONFIG.halfAngleDeg };
+  }
+  return { R: h.R, sigmaAng: sigFromStability(h.R, w.wind_speed_10m) };
+}
+
 function addRecord() {
   const level = state.selectedLevel;
-  const cfg = CONFIG.levels[level];
   const w = state.weather;
 
   if (state.lat == null || state.lon == null) {
@@ -733,44 +950,8 @@ function addRecord() {
   }
 
   const bearing = w.wind_direction_10m; // 气象风向 = 风的来向 = 污染源方位
-  const windSpeed = w.wind_speed_10m;
-
-  // 几何在 WGS-84 中计算，绘制前统一转 GCJ-02
-  const poly = sectorPolygon(
-    state.lat, state.lon, bearing, CONFIG.halfAngleDeg, cfg.near, cfg.far
-  ).map(([la, lo]) => toDisp(la, lo));
-  const sector = L.polygon(poly, {
-    color: cfg.color,
-    weight: 1.5,
-    opacity: 0.9,
-    fillColor: cfg.color,
-    fillOpacity: 0.18,
-    interactive: false,
-  }).addTo(map);
-
-  const dot = L.circleMarker(toDisp(state.lat, state.lon), {
-    radius: 4,
-    color: '#0b1220',
-    weight: 1,
-    fillColor: cfg.color,
-    fillOpacity: 1,
-    interactive: false,
-  }).addTo(map);
-
-  // 估算的"大概位置"：扇形中线，取距离区间中点
-  const midR = (cfg.near + cfg.far) / 2;
-  const estPos = destination(state.lat, state.lon, bearing, midR);
-  const estCircle = L.circle(toDisp(estPos[0], estPos[1]), {
-    radius: Math.max((cfg.far - cfg.near) / 2, 20),
-    color: cfg.color,
-    weight: 1.5,
-    dashArray: '6 6',
-    opacity: 0.85,
-    fillColor: cfg.color,
-    fillOpacity: 0.06,
-    interactive: false,
-  }).addTo(map);
-  estCircle.bindTooltip('粗略估算位置范围', { direction: 'top' });
+  const windSpeed = w.wind_speed_10m == null ? 0 : Number(w.wind_speed_10m);
+  const st = windStabilityOf(w);
 
   const rec = {
     id: ++state.seq,
@@ -780,16 +961,28 @@ function addRecord() {
     level,
     bearing,
     windSpeed,
-    sector,
-    dot,
-    estCircle,
+    windSource: w.source || '',
+    windR: st.R,
+    sigmaAng: st.sigmaAng,
+    accuracy: state.accuracy == null ? null : Math.round(state.accuracy),
+    surveyId: state.survey ? state.survey.id : null,
   };
+  buildRecordLayers(rec);
   state.records.push(rec);
 
   renderRecords();
-  renderSummary(bearing, windSpeed, cfg);
-  fitToLayer(sector);
+  renderSummary(rec);
+  fitToLayer(rec.sector);
   updateFusion();
+  saveSession();
+
+  if (state.survey) {
+    state.survey.lastPromptAt = Date.now();
+    state.survey.dueNotified = false;
+    updateSurveyGradient();
+  }
+  updateSurveyUI();
+  updateEvalUI();
 }
 
 /** 让要素落在底部面板上方的可视区域，而不是被面板遮住 */
@@ -802,16 +995,19 @@ function fitToLayer(layer) {
   });
 }
 
-function renderSummary(bearing, windSpeed, cfg) {
-  const level = state.selectedLevel;
+function renderSummary(rec) {
+  const cfg = CONFIG.levels[rec.level];
   const range =
     cfg.near === 0 ? `约 0–${cfg.far} 米` : `约 ${cfg.near}–${cfg.far} 米`;
+  const extra = rec.sigmaAng != null && rec.sigmaAng >= 35
+    ? `<br>该次观测期间风向摆动较大，方位不确定度已放宽（σ≈${rec.sigmaAng}°）。`
+    : '';
   els.summary.innerHTML = `
     <div class="sum-card">
-      污染源可能在当前位置的 <b>${dirName(bearing)}方向</b>，距离 <b>${range}</b>（粗略估计）。
+      污染源可能在当前位置的 <b>${dirName(rec.bearing)}方向</b>，距离 <b>${range}</b>（粗略估计）。
       <div class="sub">
-        依据：${dirName(bearing)}风 ${Math.round(bearing)}°、${windSpeed.toFixed(1)} m/s；
-        气味等级 ${level}（${cfg.label}）。距离区间为经验值，虚线圆只表示区间中点。
+        依据：${dirName(rec.bearing)}风 ${Math.round(rec.bearing)}°、${rec.windSpeed.toFixed(1)} m/s；
+        气味等级 ${rec.level}（${cfg.label}）。距离区间为经验值，虚线圆只表示区间中点。${extra}
       </div>
     </div>`;
 }
@@ -828,18 +1024,40 @@ function renderRecords() {
     const el = document.createElement('div');
     el.className = 'rec';
     el.style.setProperty('--c', cfg.color);
+    const surveyTag = r.surveyId ? ' · 巡测' : '';
     el.innerHTML = `
       <span class="dot"></span>
       <div class="main">
-        <div class="lvl">等级 ${r.level} · ${cfg.label}</div>
+        <div class="lvl">等级 ${r.level} · ${cfg.label}${surveyTag}</div>
         <div class="meta">
           ${dirName(r.bearing)}风 ${Math.round(r.bearing)}° · ${r.windSpeed.toFixed(1)} m/s ·
           ${r.time.toLocaleTimeString('zh-CN', { hour12: false })}
         </div>
-      </div>`;
+      </div>
+      <button type="button" class="rec-del" aria-label="删除这条记录">×</button>`;
     el.addEventListener('click', () => focusRecord(r));
+    el.querySelector('.rec-del').addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      removeRecord(r.id);
+    });
     els.records.appendChild(el);
   });
+}
+
+function removeRecord(id) {
+  const i = state.records.findIndex((r) => r.id === id);
+  if (i < 0) return;
+  const [r] = state.records.splice(i, 1);
+  map.removeLayer(r.sector);
+  map.removeLayer(r.dot);
+  map.removeLayer(r.estCircle);
+  renderRecords();
+  if (state.records.length) renderSummary(state.records[state.records.length - 1]);
+  else els.summary.innerHTML = '';
+  updateFusion();
+  saveSession();
+  updateSurveyGradient();
+  updateEvalUI();
 }
 
 function focusRecord(r) {
@@ -852,6 +1070,7 @@ function focusRecord(r) {
 }
 
 function clearAll() {
+  if (state.survey) stopSurvey();
   removeHeatmap();
   state.records.forEach((r) => {
     map.removeLayer(r.sector);
@@ -859,9 +1078,431 @@ function clearAll() {
     map.removeLayer(r.estCircle);
   });
   state.records = [];
+  state.lastSurvey = null;
   els.summary.innerHTML = '';
+  els.surveyGrad.classList.add('hidden');
+  els.surveyText.textContent = '巡测：走动中每隔约 45 秒评一次气味，可看增强方向';
+  els.surveyText.classList.remove('due');
+  removeGradient();
+  removeTrail();
+  clearEvalTruth();
   renderRecords();
   updateFusion();
+  saveSession();
+  updateSurveyUI();
+  updateEvalUI();
+}
+
+/* ---------------- 巡测（走动观测 + 气味增强方向） ---------------- */
+
+function removeTrail() {
+  if (state.trailLayer) {
+    map.removeLayer(state.trailLayer);
+    state.trailLayer = null;
+  }
+}
+
+function drawTrail() {
+  const s = state.survey;
+  if (!s || !s.trail.length) return;
+  const pts = s.trail.map(([la, lo]) => toDisp(la, lo));
+  if (!state.trailLayer) {
+    state.trailLayer = L.polyline(pts, {
+      color: '#38bdf8', weight: 3, opacity: 0.55, interactive: false,
+    }).addTo(map);
+  } else {
+    state.trailLayer.setLatLngs(pts);
+  }
+}
+
+function removeGradient() {
+  if (state.gradientLayer) {
+    map.removeLayer(state.gradientLayer);
+    state.gradientLayer = null;
+  }
+  if (state.gradientMarker) {
+    map.removeLayer(state.gradientMarker);
+    state.gradientMarker = null;
+  }
+}
+
+function renderGradient(g, pts) {
+  removeGradient();
+  if (!g || g.brg == null) {
+    if (pts.length >= 2) {
+      els.surveyGrad.textContent =
+        '各观测点间距太小或气味等级相同，暂时判断不出气味增强方向。';
+      els.surveyGrad.classList.remove('hidden');
+    } else {
+      els.surveyGrad.classList.add('hidden');
+    }
+    return;
+  }
+  const ref = pts.length ? pts[pts.length - 1] : null;
+  if (!ref) return;
+
+  const end = destination(ref.lat, ref.lon, g.brg, 150);
+  state.gradientLayer = L.polyline(
+    [toDisp(ref.lat, ref.lon), toDisp(end[0], end[1])],
+    { color: '#f59e0b', weight: 4, opacity: 0.9, interactive: false }
+  ).addTo(map);
+  state.gradientMarker = L.marker(toDisp(end[0], end[1]), {
+    icon: L.divIcon({
+      className: 'survey-arrow',
+      html: `<div class="arrow-glyph" style="transform:rotate(${g.brg.toFixed(1)}deg)">▲</div>`,
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+    }),
+    interactive: false,
+  }).addTo(map);
+
+  let txt = `气味增强方向：<b>${dirName(g.brg)}</b>（${Math.round(g.brg)}°），` +
+    `一致性 ${g.R.toFixed(2)}（${g.pairs} 组对比）。`;
+  txt += g.reliable
+    ? '沿箭头方向再走一段，通常会更接近源。'
+    : '信号还不够一致，建议沿不同方向多走几个点。';
+  if (g.skippedWind) {
+    txt += ` 另有 ${g.skippedWind} 组因两次观测间风向变化较大被忽略。`;
+  }
+  els.surveyGrad.innerHTML = txt;
+  els.surveyGrad.classList.remove('hidden');
+}
+
+function surveyRecords() {
+  const id = state.survey ? state.survey.id
+    : (state.lastSurvey ? state.lastSurvey.id : null);
+  return id == null ? [] : state.records.filter((r) => r.surveyId === id);
+}
+
+function updateSurveyGradient() {
+  if (!state.survey && !state.lastSurvey) return;
+  const pts = surveyRecords();
+  const g = smellGradient(pts);
+  if (state.survey) state.survey.gradient = g;
+  else if (state.lastSurvey) state.lastSurvey.gradient = g;
+  renderGradient(g, pts);
+}
+
+function updateSurveyUI() {
+  const s = state.survey;
+  if (!s) return;
+  const mins = Math.floor((Date.now() - s.startedAt) / 60000);
+  const n = state.records.filter((r) => r.surveyId === s.id).length;
+  const since = Math.floor((Date.now() - s.lastPromptAt) / 1000);
+  const due = n > 0 && Date.now() - s.lastPromptAt >= CONFIG.surveyPromptMs;
+  let txt = `巡测中 · 已 ${mins} 分钟 · 记录 ${n} 点`;
+  if (!n) txt += ' · 走几步后按气味选择等级提交';
+  else if (due) txt += ` · 距上次评分 ${since} 秒，建议再评一次`;
+  els.surveyText.textContent = txt;
+  els.surveyText.classList.toggle('due', due);
+  if (due && !s.dueNotified) {
+    s.dueNotified = true;
+    if (navigator.vibrate) {
+      try { navigator.vibrate(80); } catch (_) { /* 忽略 */ }
+    }
+  }
+}
+
+function onSurveyPos(pos) {
+  const s = state.survey;
+  if (!s) return;
+  const { latitude, longitude, accuracy } = pos.coords;
+  const acc = accuracy == null ? null : accuracy;
+  applyFix(latitude, longitude, acc);
+  if (acc != null && acc > 60) return; // 精度太差点只更新位置，不进轨迹
+  if (state.lat == null || state.lon == null) return;
+  const last = s.trail[s.trail.length - 1];
+  const moved = last ? relPos(last[0], last[1], state.lat, state.lon).d : Infinity;
+  if (moved >= CONFIG.surveyTrailMinDist) {
+    s.trail.push([state.lat, state.lon]);
+    if (s.trail.length > 800) s.trail.shift();
+    drawTrail();
+  }
+}
+
+function onSurveyErr(err) {
+  const s = state.survey;
+  if (!s || s.errWarned) return;
+  s.errWarned = true;
+  setWarn('巡测定位出错：' + describeGeoError(err));
+}
+
+function startSurvey() {
+  if (state.survey) { stopSurvey(); return; }
+  if (!navigator.geolocation) {
+    setWarn('此浏览器不支持定位，无法巡测；可在不同位置点地图手动记录。', true);
+    return;
+  }
+  if (!window.isSecureContext) {
+    setWarn('巡测需要 HTTPS 定位；可点击地图手动记录，或改用 HTTPS 访问。', true);
+    return;
+  }
+  const id = Date.now();
+  state.survey = {
+    id, startedAt: id, lastPromptAt: id,
+    trail: [], watchId: null, gradient: null,
+    dueNotified: false, errWarned: false,
+  };
+  state.lastSurvey = null;
+  removeTrail();
+  removeGradient();
+  els.surveyGrad.classList.add('hidden');
+  state.survey.watchId = navigator.geolocation.watchPosition(
+    onSurveyPos, onSurveyErr,
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+  );
+  state.surveyTimer = setInterval(updateSurveyUI, 5000);
+  els.surveyBtn.textContent = '结束巡测';
+  els.surveyBtn.classList.add('on');
+  refreshWeather(false);
+  updateSurveyUI();
+  setWarn('巡测开始：走动中每隔约 45 秒评一次气味，感到明显变化也可随时提交。');
+}
+
+function stopSurvey() {
+  const s = state.survey;
+  if (!s) return;
+  if (s.watchId != null) navigator.geolocation.clearWatch(s.watchId);
+  if (state.surveyTimer) {
+    clearInterval(state.surveyTimer);
+    state.surveyTimer = null;
+  }
+  const pts = state.records.filter((r) => r.surveyId === s.id);
+  const g = smellGradient(pts);
+  const ref = pts.length ? pts[pts.length - 1] : null;
+  state.lastSurvey = {
+    id: s.id,
+    gradient: g,
+    points: pts.length,
+    lat: ref ? ref.lat : state.lat,
+    lon: ref ? ref.lon : state.lon,
+  };
+  state.survey = null;
+  els.surveyBtn.textContent = '开始巡测';
+  els.surveyBtn.classList.remove('on');
+  els.surveyText.classList.remove('due');
+  els.surveyText.textContent = `巡测结束：共记录 ${pts.length} 个点` +
+    (g && g.brg != null ? '，气味增强方向见地图箭头' : '');
+  renderGradient(g, pts);
+}
+
+/* ---------------- 导出 ---------------- */
+
+function dateStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_` +
+    `${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+function downloadText(filename, text, mime) {
+  try {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 1500);
+  } catch (e) {
+    setWarn('导出失败：' + e.message, true);
+  }
+}
+
+function exportRecordsCsv() {
+  if (!state.records.length) {
+    setWarn('还没有记录可导出。');
+    return;
+  }
+  downloadText(`odor_records_${dateStamp()}.csv`,
+    EXPORTERS.recordsToCsv(state.records), 'text/csv;charset=utf-8');
+  setWarn(`已导出 ${state.records.length} 条记录（CSV，WGS-84 坐标）。`);
+}
+
+function exportGeoJson() {
+  if (!state.records.length) {
+    setWarn('还没有记录可导出。');
+    return;
+  }
+  const g = state.lastSurvey ? state.lastSurvey.gradient
+    : (state.survey ? state.survey.gradient : null);
+  const ref = state.lastSurvey ? state.lastSurvey
+    : (state.survey && state.lat != null ? { lat: state.lat, lon: state.lon } : null);
+  let extra = null;
+  if (g && g.brg != null && ref &&
+      Number.isFinite(ref.lat) && Number.isFinite(ref.lon)) {
+    extra = { gradient: g, lat: ref.lat, lon: ref.lon };
+  }
+  downloadText(`odor_survey_${dateStamp()}.geojson`,
+    EXPORTERS.recordsToGeoJson(state.records, state.fusion, extra),
+    'application/geo+json;charset=utf-8');
+  setWarn(`已导出 ${state.records.length} 条记录和融合结果（GeoJSON）。`);
+}
+
+function saveEvals() {
+  try {
+    localStorage.setItem(EVALS_KEY, JSON.stringify(state.evals.slice(-50)));
+  } catch (_) { /* 忽略 */ }
+}
+
+function exportEvalsCsv() {
+  if (!state.evals.length) {
+    setWarn('还没有对照评估结果可导出。');
+    return;
+  }
+  downloadText(`odor_eval_${dateStamp()}.csv`,
+    EXPORTERS.evalsToCsv(state.evals), 'text/csv;charset=utf-8');
+  setWarn(`已导出 ${state.evals.length} 次评估结果。`);
+}
+
+/* ---------------- 对照实验（真值评估） ---------------- */
+
+function removeEvalLine() {
+  if (state.evalLine) {
+    map.removeLayer(state.evalLine);
+    state.evalLine = null;
+  }
+}
+
+function removeEvalMarker() {
+  if (state.evalMarker) {
+    map.removeLayer(state.evalMarker);
+    state.evalMarker = null;
+  }
+}
+
+function clearEvalTruth() {
+  state.evalPick = false;
+  state.evalTruth = null;
+  removeEvalMarker();
+  removeEvalLine();
+  updateEvalUI();
+}
+
+function drawEvalMarker() {
+  removeEvalMarker();
+  const t = state.evalTruth;
+  if (!t) return;
+  state.evalMarker = L.marker(toDisp(t.lat, t.lon), {
+    icon: L.divIcon({
+      className: 'truth-icon', html: '★',
+      iconSize: [26, 26], iconAnchor: [13, 13],
+    }),
+    interactive: false,
+  }).addTo(map);
+  state.evalMarker.bindTooltip('真实源位置（对照实验）', { direction: 'top' });
+}
+
+function setEvalTruth(lat, lon) {
+  state.evalTruth = { lat, lon };
+  state.evalPick = false;
+  removeEvalLine(); // 换了真值，旧连线失效
+  drawEvalMarker();
+  updateEvalUI();
+  setWarn('已记录真实源位置。点「计算评估」查看命中情况。');
+}
+
+function startEvalPick() {
+  if (state.evalPick) {
+    state.evalPick = false;
+    updateEvalUI();
+    setWarn('已取消选择真值。');
+    return;
+  }
+  if (state.records.length < 2) {
+    setWarn('至少需要 2 条记录才能做对照评估。');
+    return;
+  }
+  state.evalPick = true;
+  updateEvalUI();
+  setWarn('请在地图上点一下真实的污染源位置。', true);
+}
+
+function runEvaluation() {
+  const f = state.fusion;
+  const truth = state.evalTruth;
+  if (!truth) { setWarn('请先在地图上选真实源位置。'); return; }
+  if (!f || f.error || state.records.length < 2) {
+    setWarn('需要至少 2 条记录和有效的融合结果。');
+    return;
+  }
+  const p = FUSION.probAt(f, truth.lat, truth.lon);
+  const hit50 = p >= f.thresholds.p50;
+  const hit80 = p >= f.thresholds.p80;
+  const dPeak = relPos(truth.lat, truth.lon, f.peak.lat, f.peak.lon).d;
+
+  let clat = 0, clon = 0;
+  state.records.forEach((r) => { clat += r.lat; clon += r.lon; });
+  clat /= state.records.length;
+  clon /= state.records.length;
+  const bTruth = relPos(clat, clon, truth.lat, truth.lon).brg;
+  const bPeak = relPos(clat, clon, f.peak.lat, f.peak.lon).brg;
+  const dirErr = FUSION.angDiff(bTruth, bPeak);
+
+  const entry = {
+    time: new Date().toISOString(),
+    truth: { lat: truth.lat, lon: truth.lon },
+    peak: { lat: f.peak.lat, lon: f.peak.lon },
+    p, hit50, hit80, dPeak, dirErr, n: state.records.length,
+  };
+  state.evals.push(entry);
+  if (state.evals.length > 50) state.evals.splice(0, state.evals.length - 50);
+  saveEvals();
+
+  removeEvalLine();
+  state.evalLine = L.polyline(
+    [toDisp(truth.lat, truth.lon), toDisp(f.peak.lat, f.peak.lon)],
+    { color: '#c084fc', weight: 2, dashArray: '5 5', opacity: 0.9, interactive: false }
+  ).addTo(map);
+
+  renderEvalSummary(entry);
+  updateEvalUI();
+}
+
+function renderEvalSummary(latest) {
+  if (!latest) {
+    latest = state.evals[state.evals.length - 1];
+  }
+  if (!latest) {
+    els.evalText.textContent = '';
+    return;
+  }
+  const yes = (v) => (v ? '✓' : '✗');
+  const n = state.evals.length;
+  const h50 = state.evals.filter((e) => e.hit50).length;
+  const h80 = state.evals.filter((e) => e.hit80).length;
+  const cell = state.fusion && !state.fusion.error
+    ? Math.round(Math.sqrt(state.fusion.cellArea)) : null;
+  els.evalText.innerHTML =
+    `最近一次：真值在 50% 区内 <b>${yes(latest.hit50)}</b>、` +
+    `80% 区内 <b>${yes(latest.hit80)}</b>；` +
+    `距峰值 ${Math.round(latest.dPeak)} m，方向偏差约 ${Math.round(latest.dirErr)}°。` +
+    (cell ? `（按格点概率判定，格点边长约 ${cell} m。）` : '') +
+    `<br>累计 ${n} 次对照：80% 区命中 ${h80} 次` +
+    `（${Math.round(100 * h80 / n)}%），50% 区命中 ${h50} 次` +
+    `（${Math.round(100 * h50 / n)}%）。`;
+}
+
+function updateEvalUI() {
+  if (!els.evalRun) return;
+  els.evalRun.disabled = !(
+    state.evalTruth && state.fusion && !state.fusion.error &&
+    state.records.length >= 2
+  );
+  els.evalPick.textContent = state.evalPick ? '点地图选真值…' : '在地图上选真值';
+  els.evalPick.classList.toggle('on', state.evalPick);
+  els.evalExport.classList.toggle('hidden', !state.evals.length);
+  if (!state.evals.length) els.evalText.textContent = '';
+  else renderEvalSummary();
+}
+
+function toggleEvalPanel() {
+  els.evalPanel.classList.toggle('hidden');
+  updateEvalUI();
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -875,11 +1516,26 @@ els.mwApply.addEventListener('click', applyManualWind);
 els.calib.addEventListener('click', toggleCalibration);
 els.fusionToggle.addEventListener('click', toggleHeat);
 els.fusionFocus.addEventListener('click', focusFusion);
+els.surveyBtn.addEventListener('click', startSurvey);
+els.exportCsv.addEventListener('click', exportRecordsCsv);
+els.exportGeo.addEventListener('click', exportGeoJson);
+els.evalToggle.addEventListener('click', toggleEvalPanel);
+els.evalPick.addEventListener('click', startEvalPick);
+els.evalRun.addEventListener('click', runEvaluation);
+els.evalClear.addEventListener('click', () => {
+  clearEvalTruth();
+  setWarn('已清除对照真值。');
+});
+els.evalExport.addEventListener('click', exportEvalsCsv);
 
 map.on('click', (e) => {
   const [lat, lon] = gcj02ToWgs84(e.latlng.lat, e.latlng.lng);
   if (state.calibrating) {
     applyCalibration(lat, lon);
+    return;
+  }
+  if (state.evalPick) {
+    setEvalTruth(lat, lon);
     return;
   }
   setLocation(lat, lon, null, true);
@@ -888,9 +1544,11 @@ map.on('click', (e) => {
 /* ---------------- 启动 ---------------- */
 
 renderLevelButtons();
+restoreSession();
 renderRecords();
 updateSubmitState();
 updateCalibButton();
+updateEvalUI();
 renderFusion();
 
 if (/MicroMessenger/i.test(navigator.userAgent)) {

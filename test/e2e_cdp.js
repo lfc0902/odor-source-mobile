@@ -258,6 +258,191 @@ async function shot(cdp, filename) {
       'hidden:document.getElementById("fusion").classList.contains("hidden"),' +
       'hasHeat:!!state.heatmap})'));
 
+    // 巡测：走动记录 3 个点（气味逐渐增强）→ 增强方向箭头 + 轨迹
+    const surveyWeather = `{source:'手动输入', wind_speed_10m:2, wind_direction_10m:0,
+      desc:'', temperature_2m:null, relative_humidity_2m:null, history:null}`;
+    report.survey = JSON.parse(await evalJs(cdp, `(() => {
+      clearAll();
+      startSurvey();
+      const active = !!state.survey;
+      const sid = state.survey && state.survey.id;
+      state.weather = ${surveyWeather};
+      state.lat = 39.9042; state.lon = 116.4074; state.manualLocation = true;
+      selectLevel(2); addRecord();
+      state.lat = 39.9062; state.lon = 116.4074;
+      selectLevel(4); addRecord();
+      state.lat = 39.9082; state.lon = 116.4074;
+      selectLevel(5); addRecord();
+      const g = state.survey && state.survey.gradient;
+      const res = {
+        active,
+        btn: document.getElementById('btnSurvey').innerText,
+        records: state.records.length,
+        tagged: state.records.every((r) => r.surveyId === sid),
+        gradient: g,
+        gradText: document.getElementById('surveyGrad').innerText,
+        hasArrow: !!state.gradientLayer && map.hasLayer(state.gradientLayer),
+        hasArrowHead: !!state.gradientMarker,
+      };
+      stopSurvey();
+      res.stopped = !state.survey;
+      res.stopBtn = document.getElementById('btnSurvey').innerText;
+      res.stopText = document.getElementById('surveyText').innerText;
+      res.lastSurveyPoints = state.lastSurvey && state.lastSurvey.points;
+      res.arrowAfterStop = !!state.gradientLayer && map.hasLayer(state.gradientLayer);
+      return JSON.stringify(res);
+    })()`));
+    await sleep(800);
+    await shot(cdp, '_e2e_survey.png');
+
+    // 风场历史：用固定响应验证解析与一致性计算
+    report.windHistory = JSON.parse(await evalJs(cdp, `(async () => {
+      const orig = window.fetch.bind(window);
+      const now = Date.now();
+      const times = [];
+      for (let i = 5; i >= 0; i--) times.push(new Date(now - i * 3600e3).toISOString());
+      window.fetch = (u, o) => String(u).includes('hourly=wind_speed_10m')
+        ? Promise.resolve(new Response(JSON.stringify({ hourly: {
+            time: times,
+            wind_direction_10m: [270, 272, 268, 275, 271, 269],
+            wind_speed_10m: [3, 3.2, 2.9, 3.1, 3, 3.3],
+          } })))
+        : orig(u, o);
+      let h = null, err = null;
+      try { h = await fetchWindHistory(39.9, 116.4); } catch (e) { err = e.message; }
+      window.fetch = orig;
+      return JSON.stringify({ h, err,
+        sigma: h ? SURVEY.sigFromStability(h.R, h.meanSpeed) : null });
+    })()`));
+
+    // 稳定性联动：稳定风 → 默认 25°；不稳定风 → 放宽 + 融合提示
+    report.stabilityLink = JSON.parse(await evalJs(cdp, `(() => {
+      state.weather = { source: 'Open-Meteo', wind_speed_10m: 2.5,
+        wind_direction_10m: 0, desc: '', temperature_2m: null,
+        relative_humidity_2m: null,
+        history: { meanDir: 326, R: 0.98, meanSpeed: 3, count: 6 } };
+      state.lat = 39.9042; state.lon = 116.4074;
+      selectLevel(4); addRecord();
+      const stableSigma = state.records[state.records.length - 1].sigmaAng;
+      state.weather.history = { meanDir: 200, R: 0.2, meanSpeed: 2, count: 6 };
+      addRecord();
+      const unstableSigma = state.records[state.records.length - 1].sigmaAng;
+      renderWeather(state.weather);
+      const hint = document.getElementById('windHint');
+      const f = state.fusion;
+      return JSON.stringify({
+        stableSigma, unstableSigma,
+        hintHidden: hint.classList.contains('hidden'),
+        hintText: hint.innerText,
+        records: state.records.length,
+        conf: f && f.confidence,
+        notes: f && f.notes,
+      });
+    })()`));
+
+    // 对照评估：真值=峰值 → 命中；真值远离 → 不命中；评估可持久化
+    report.evaluation = JSON.parse(await evalJs(cdp, `(() => {
+      const f = state.fusion;
+      const truth = { lat: f.peak.lat, lon: f.peak.lon };
+      setEvalTruth(truth.lat, truth.lon);
+      const pickOff = !state.evalPick;
+      runEvaluation();
+      const e1 = state.evals[state.evals.length - 1];
+      setEvalTruth(truth.lat - 0.03, truth.lon); // 约 3.3 km 外
+      runEvaluation();
+      const e2 = state.evals[state.evals.length - 1];
+      const stored = JSON.parse(localStorage.getItem('odor_evals_v1') || '[]');
+      return JSON.stringify({
+        pickOff,
+        hit50: e1.hit50, hit80: e1.hit80, pPeak: e1.p,
+        farHit80: e2.hit80, farHit50: e2.hit50,
+        evalCount: state.evals.length,
+        storedCount: stored.length,
+        text: document.getElementById('evalText').innerText,
+        hasMarker: !!state.evalMarker && map.hasLayer(state.evalMarker),
+        hasLine: !!state.evalLine && map.hasLayer(state.evalLine),
+        runDisabled: document.getElementById('btnEvalRun').disabled,
+      });
+    })()`));
+
+    // 评估选点：点地图 → GCJ 反算为 WGS 真值
+    report.evalPickClick = JSON.parse(await evalJs(cdp, `(() => {
+      startEvalPick();
+      const picking = state.evalPick;
+      const t = wgs84ToGcj02(39.9070, 116.4130);
+      map.fire('click', { latlng: L.latLng(t[0], t[1]) });
+      return JSON.stringify({
+        picking, pickOff: !state.evalPick,
+        lat: state.evalTruth && state.evalTruth.lat,
+        lon: state.evalTruth && state.evalTruth.lon,
+      });
+    })()`));
+
+    // 导出：直接验证纯函数输出
+    report.exports = JSON.parse(await evalJs(cdp, `(() => {
+      const csv = EXPORTERS.recordsToCsv(state.records);
+      const g = state.lastSurvey && state.lastSurvey.gradient;
+      const gj = JSON.parse(EXPORTERS.recordsToGeoJson(state.records, state.fusion,
+        { gradient: g, lat: state.lastSurvey.lat, lon: state.lastSurvey.lon }));
+      const ecsv = EXPORTERS.evalsToCsv(state.evals);
+      return JSON.stringify({
+        csvLines: csv.trim().split(/\\r?\\n/).length,
+        csvHeader: csv.slice(1, 30),
+        geojsonFeatures: gj.features.length,
+        kinds: gj.features.map((f) => f.properties.kind),
+        evalLines: ecsv.trim().split(/\\r?\\n/).length,
+        hasButtons: !!document.getElementById('btnExportCsv') &&
+          !!document.getElementById('btnExportGeo'),
+      });
+    })()`));
+
+    // 刷新页面：记录、融合热区、评估历史应从本机恢复
+    const beforeReload = await evalJs(cdp, 'state.records.length');
+    await cdp.send('Page.navigate', {
+      url: BASE + (BASE.includes('?') ? '&' : '?') + 't=' + Date.now(),
+    });
+    let loaded = -1;
+    for (let i = 0; i < 30; i++) {
+      try {
+        loaded = await evalJs(cdp,
+          'typeof state !== "undefined" && state.records ? state.records.length : -1');
+        if (loaded >= 0 && loaded === beforeReload) break;
+      } catch (_) { /* 页面还在重载 */ }
+      await sleep(500);
+    }
+    await sleep(1500);
+    report.persistence = JSON.parse(await evalJs(cdp, `JSON.stringify({
+      beforeReload: ${beforeReload},
+      records: state.records.length,
+      fusionVisible: !document.getElementById('fusion').classList.contains('hidden'),
+      hasHeat: !!state.heatmap && map.hasLayer(state.heatmap),
+      hasPeak: !!state.peakMarker && map.hasLayer(state.peakMarker),
+      evals: state.evals.length,
+      evalText: document.getElementById('evalText').innerText,
+      sessionRecords: (JSON.parse(localStorage.getItem('odor_session_v1') || '{}')
+        .records || []).length,
+    })`));
+    await shot(cdp, '_e2e_restore.png');
+
+    // 滚动到底部：检查导出/评估卡片与记录删除按钮
+    await evalJs(cdp, 'document.getElementById("sheet").scrollTop = 1e6; true');
+    await sleep(400);
+    await shot(cdp, '_e2e_tools.png');
+
+    // 恢复后删除单条记录 → 融合与本机会话同步更新
+    report.deleteRecord = JSON.parse(await evalJs(cdp, `(() => {
+      const before = state.records.length;
+      removeRecord(state.records[0].id);
+      const stored = JSON.parse(localStorage.getItem('odor_session_v1') || '{}');
+      return JSON.stringify({
+        before, after: state.records.length,
+        stored: (stored.records || []).length,
+        fusionVisible: !document.getElementById('fusion').classList.contains('hidden'),
+      });
+    })()`));
+    await evalJs(cdp, 'clearAll(); true');
+    report.afterNewTestsClear = await evalJs(cdp, 'state.records.length');
+
     // 备源链路模拟：让 Open-Meteo 失败，应自动落到 wttr.in
     report.fallback = JSON.parse(await evalJs(cdp, `(async () => {
       const orig = window.fetch.bind(window);

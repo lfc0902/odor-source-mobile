@@ -255,6 +255,80 @@ html, body {
 .conf.low { color: #450a0a; background: var(--danger); }
 .fusion-text { margin-top: 6px; font-size: 12px; line-height: 1.6; color: var(--text); }
 .fusion-note { margin-top: 6px; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--muted);
+}
+.legend-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #38bdf8, #22c55e, #eab308, #ef4444);
+}
+
+/* ---------- 风场稳定性提示 ---------- */
+.wind-hint { margin-top: 3px; font-size: 11px; line-height: 1.5; }
+.wind-hint.ok { color: #86efac; }
+.wind-hint.warnish { color: #fbbf24; }
+.wind-hint.bad { color: #fca5a5; }
+
+/* ---------- 巡测 ---------- */
+.survey {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.survey-row { display: flex; align-items: center; gap: 8px; }
+.survey-text { flex: 1; min-width: 0; font-size: 12px; line-height: 1.5; color: var(--muted); }
+.survey-text.due { color: #fbbf24; }
+.survey-grad {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--line);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text);
+}
+.survey-grad b { color: #f59e0b; }
+.survey-arrow, .truth-icon { background: none; border: none; }
+.arrow-glyph {
+  width: 30px;
+  height: 30px;
+  line-height: 30px;
+  text-align: center;
+  font-size: 27px;
+  color: #f59e0b;
+  text-shadow: 0 0 6px rgba(0, 0, 0, .9);
+}
+.truth-icon {
+  width: 26px;
+  height: 26px;
+  line-height: 26px;
+  text-align: center;
+  font-size: 24px;
+  color: #c084fc;
+  text-shadow: 0 0 7px rgba(0, 0, 0, .95);
+}
+
+/* ---------- 导出与评估 ---------- */
+.tools {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 8px 10px;
+  background: var(--panel);
+}
+.tools-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.eval-panel { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.eval-hint { font-size: 11px; line-height: 1.5; color: var(--muted); margin-bottom: 6px; }
+.eval-text { margin-top: 8px; font-size: 12px; line-height: 1.6; color: var(--text); }
+.eval-text:empty { display: none; }
 
 /* ---------- 记录列表 ---------- */
 .records { display: flex; flex-direction: column; gap: 6px; }
@@ -281,6 +355,18 @@ html, body {
 .rec .main { flex: 1; min-width: 0; }
 .rec .lvl { font-weight: 600; }
 .rec .meta { color: var(--muted); margin-top: 2px; }
+.rec-del {
+  appearance: none;
+  flex: 0 0 auto;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.rec-del:active { color: var(--danger); background: rgba(239, 68, 68, .12); }
 .empty { color: var(--muted); font-size: 12px; padding: 6px 0 10px; }
 
 .foot {

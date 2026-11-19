@@ -65,4 +65,24 @@ check('少于两条记录不融合', () => {
   assert.strictEqual(F.compute([]), null);
 });
 
+check('单条记录的风向不确定度可单独放宽', () => {
+  const wide = Object.assign({}, B, { sigmaAng: 45 });
+  const base = F.compute([A, B], { cells: 128, sigmaAng: 25, halfAngle: 25 });
+  const f = F.compute([A, wide], { cells: 128, sigmaAng: 25, halfAngle: 25 });
+  assert(f && !f.error);
+  assert(f.region80.area > base.region80.area * 1.2, '放宽后 80% 区明显更大');
+  assert(f.notes.some((s) => s.includes('风向')), '应提示风场不稳定');
+  assert.notStrictEqual(f.confidence, 'high');
+});
+
+check('输出分位阈值，probAt 可用于命中判定', () => {
+  const f = F.compute([A, B], { cells: 128, sigmaAng: 25, halfAngle: 25 });
+  assert(f.thresholds && f.thresholds.p50 > 0 && f.thresholds.p80 > 0);
+  assert(f.thresholds.p80 <= f.thresholds.p50, '80% 区阈值不高于 50% 区');
+  const pPeak = F.probAt(f, f.peak.lat, f.peak.lon);
+  assert(pPeak > 0, '峰值格点概率 > 0');
+  assert(pPeak >= f.thresholds.p50, '峰值必在 50% 区内');
+  assert.strictEqual(F.probAt(f, 0, 0), 0, '范围外为 0');
+});
+
 console.log(`fusion tests passed: ${passed} groups`);

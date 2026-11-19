@@ -48,7 +48,9 @@
   function logLikelihood(rec, lat, lon, sigmaAng) {
     const { d, brg } = rel(rec.lat, rec.lon, lat, lon);
     const da = angDiff(brg, rec.bearing);
-    const ang = Math.exp(-0.5 * Math.pow(da / sigmaAng, 2));
+    // 每条记录可按其观测期间的风场稳定性单独放宽方位不确定度
+    const sig = rec.sigmaAng != null ? rec.sigmaAng : sigmaAng;
+    const ang = Math.exp(-0.5 * Math.pow(da / sig, 2));
     const rad = radialWeight(rec.near, rec.far, d);
     if (ang <= 0 || rad <= 0) return -Infinity;
     return Math.log(ang) + Math.log(rad);
@@ -171,16 +173,24 @@
       (2 * halfAngle / 360) * Math.PI * (r.far * r.far - r.near * r.near);
     const minSector = Math.min.apply(null, records.map(sectorArea));
     const calm = records.some((r) => r.windSpeed != null && r.windSpeed < 0.5);
+    const unstable = records.some((r) => r.sigmaAng != null && r.sigmaAng >= 35);
+    const veryUnstable = records.some((r) => r.sigmaAng != null && r.sigmaAng >= 42);
 
     let confidence = 'medium';
     if (region80.area > 1.6 * minSector) confidence = 'low';
     else if (region80.area <= 0.6 * minSector && records.length >= 3) confidence = 'high';
     if (calm) confidence = 'low';
+    // 观测期间风场不稳定：方位不确定度已放宽，可信度不能给太高
+    if (unstable) {
+      if (confidence === 'high') confidence = 'medium';
+      if (veryUnstable) confidence = 'low';
+    }
 
     const notes = [];
     if (records.length === 2) notes.push('仅 2 条记录，建议再增加 1–2 个观测点');
     if (calm) notes.push('存在风速 <0.5 m/s 的记录，风向参考性差');
-    if (confidence === 'low' && !calm) {
+    if (unstable && !calm) notes.push('部分记录期间风向摆动较大，方位不确定度已放宽');
+    if (confidence === 'low' && !calm && !unstable) {
       notes.push('扇形交叠不集中，记录之间可能矛盾，或存在多个污染源');
     }
 
@@ -199,10 +209,20 @@
       peak,
       region50,
       region80,
+      thresholds: { p50: q50, p80: q80 },
       confidence,
       notes,
     };
   }
 
-  return { rel, angDiff, radialWeight, compute };
+  /** 某坐标所在格点的归一化概率（用于对照实验判定是否落在 50%/80% 区） */
+  function probAt(f, lat, lon) {
+    if (!f || f.error || !f.weights) return 0;
+    const i = Math.floor((lat - f.minLat) / f.dLat);
+    const j = Math.floor((lon - f.minLon) / f.dLon);
+    if (i < 0 || j < 0 || i >= f.nLat || j >= f.nLon) return 0;
+    return f.weights[i * f.nLon + j];
+  }
+
+  return { rel, angDiff, radialWeight, compute, probAt };
 });
