@@ -184,6 +184,37 @@ async function shot(cdp, filename) {
     await evalJs(cdp, 'clearAll(); true');
     report.recordsAfterManualClear = await evalJs(cdp, 'state.records.length');
 
+    // 备源链路模拟：让 Open-Meteo 失败，应自动落到 wttr.in
+    report.fallback = JSON.parse(await evalJs(cdp, `(async () => {
+      const orig = window.fetch.bind(window);
+      window.fetch = (u, o) => String(u).includes('api.open-meteo.com')
+        ? Promise.reject(new Error('模拟主源故障')) : orig(u, o);
+      state.weather = null; state.weatherAt = 0;
+      await refreshWeather(true);
+      const res = {
+        source: state.weather && state.weather.source,
+        text: document.getElementById('weatherText').innerText,
+      };
+      window.fetch = orig;
+      return JSON.stringify(res);
+    })()`));
+
+    // 全部失败：应提示并展开手动输入
+    report.allFail = JSON.parse(await evalJs(cdp, `(async () => {
+      const orig = window.fetch.bind(window);
+      window.fetch = () => Promise.reject(new Error('模拟断网'));
+      state.weather = null; state.weatherAt = 0;
+      await refreshWeather(true);
+      const res = {
+        weather: state.weather,
+        text: document.getElementById('weatherText').innerText,
+        manualVisible: !document.getElementById('manual').classList.contains('hidden'),
+        warn: document.getElementById('warnText').innerText,
+      };
+      window.fetch = orig;
+      return JSON.stringify(res);
+    })()`));
+
     // 地图点击 → GCJ-02 反算为 WGS-84
     const { gcj02ToWgs84 } = require('../js/coords.js');
     await evalJs(cdp, 'map.fire("click", {latlng: L.latLng(39.9070, 116.4130)}); true');

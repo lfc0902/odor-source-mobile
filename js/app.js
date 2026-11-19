@@ -294,7 +294,7 @@ async function fetchWeather(lat, lon) {
       errors.push(e.message);
     }
   }
-  throw new Error(errors.join(' / '));
+  throw new Error([...new Set(errors)].join(' / '));
 }
 
 async function refreshWeather(force = false) {

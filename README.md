@@ -2,7 +2,17 @@
 
 用"人的嗅觉 + 手机定位 + 当地气象"粗略反推污染源方位，不依赖浓度监测数据。
 
-## 启动
+## 在线使用（推荐）
+
+手机浏览器直接打开：**https://lfc0902.github.io/odor-source-mobile/**
+
+- HTTPS 页面，手机可以正常弹出定位授权，天气、地图都不依赖电脑。
+- 添加到主屏幕即可像 App 一样全屏使用：
+  - Android Chrome / Edge：菜单 →「添加到主屏幕」/「安装应用」
+  - iPhone Safari：分享 →「添加到主屏幕」
+- 首次打开需要联网；之后页面壳会离线缓存（地图瓦片和天气仍需网络）。
+
+## 本地启动（开发用）
 
 双击项目根目录的 `启动手机版.bat`，然后：
 
@@ -14,7 +24,9 @@
 ## 使用流程
 
 1. 打开页面 → 自动定位（或点击地图手动标点）
-2. 自动显示当地天气：风向、风速、气温、湿度（Open-Meteo，免 key）
+2. 自动显示当地天气：风向、风速、气温、湿度
+   - 主源 Open-Meteo（免 key，8 秒超时）→ 失败自动切 wttr.in（12 秒）
+   - 两个源都失败时，点「手动」输入风向（0–359°）和风速（m/s）继续使用
 3. 按当下闻到的情况选择气味等级 1–5
 4. 点击「提交嗅辨记录」→ 地图上画出**上风向扇形**和**估算位置圈**
 5. 换几个位置重复提交，多个扇形交叠处即最可能的污染源区域
@@ -32,10 +44,12 @@
 # 需先启动静态服务（8123）
 node test/geo.test.js      # 球面几何：方位/距离/扇形顶点
 node test/coords.test.js   # WGS-84 <-> GCJ-02 转换与往返精度
-node test/e2e_cdp.js       # 端到端：390x844 视口 → 定位 → 真调天气 → 提交 → 截图
+node test/e2e_cdp.js       # 端到端：390x844 视口 → 定位 → 真调天气 → 提交 → 手动风 → 兜底模拟
 ```
 
-`e2e_cdp.js` 会自动启动 headless Edge，产出 `_e2e_before.png` / `_e2e_after.png`。
+`e2e_cdp.js` 会自动启动 headless Edge（每次独立调试端口、结束时杀进程树），
+产出 `_e2e_before.png` / `_e2e_after.png` / `_e2e_manual.png`。
+测试 GitHub Pages 线上版：`BASE_URL="https://lfc0902.github.io/odor-source-mobile/" node test/e2e_cdp.js`。
 
 ## 目录
 
